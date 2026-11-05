@@ -1,0 +1,19 @@
+{
+  "name": "unified-worker",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wa": "node wa.js",
+    "tg": "node tg.js"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "firebase-admin": "^14.5.0",
+    "pino": "^10.4.0",
+    "telegram": "2.26.22"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
