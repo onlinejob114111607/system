@@ -34,6 +34,7 @@ import {
 import { createFunnel } from './funnel.js'
 import { createStore } from './store.js'
 import { buildDailyReport, selfUpdate, startDailyReport } from './report.js'
+import { createSocial } from './social.js'
 
 // مكتبة التشفير بتطبع تفاصيل الجلسات على الشاشة — بنسكتها (سجلنا بيكتب مباشرة على stdout)
 console.log = console.info = console.debug = console.warn = console.error = () => {}
@@ -1070,6 +1071,7 @@ class Account {
 const accounts = new Map()
 const funnel = createFunnel({ accounts, settings, log, event, notifier })
 const shop = createStore({ accounts, settings, log, event, notifier })
+const social = createSocial({ settings, log, event })
 
 function startAccount(id, data) {
   const acc = new Account(id, data)
@@ -1126,6 +1128,7 @@ async function handleCommand(c) {
   if (c.type === 'self_update') return selfUpdate({ repo: settings.app.system?.repo, branch: settings.app.system?.branch, log })
   if (String(c.type).startsWith('funnel_')) return funnel.command(c)
   if (String(c.type).startsWith('store_')) return shop.command(c)
+  if (String(c.type).startsWith('social_')) return social.command(c)
   if (c.type === 'clean_groups') {
     const list = c.accountId ? [accounts.get(c.accountId)].filter(Boolean) : [...accounts.values()]
     const live = list.filter((a) => a.connected)
@@ -1375,6 +1378,7 @@ async function main() {
 
   listenCommands('wa', handleCommand, log)
   startDailyReport({ settings, notifier, log })
+  social.start()
   watchRegistrations()
   funnel.start()
   shop.start()

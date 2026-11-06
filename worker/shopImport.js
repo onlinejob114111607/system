@@ -244,7 +244,7 @@ async function ensureImgBranch(repo, headers, base) {
   imgBranchReady = true
 }
 
-async function uploadGithub(priv, path, buf, log = () => {}) {
+export async function uploadGithub(priv, path, buf, log = () => {}) {
   const repo = ghRepoOf(priv)
   if (!repo || !priv.ghToken) throw new Error('جهّز رفع الصور (ريبو + توكن GitHub) من إعدادات المتجر')
   const headers = { Authorization: `Bearer ${String(priv.ghToken).trim()}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }
