@@ -308,10 +308,16 @@ export function createSocial({ settings, log, event }) {
     generate,
     async command(c) {
       const day = c.day || dayKey()
-      if (c.type === 'social_generate') return generate(day, { send: c.send !== false })
-      if (c.type === 'social_replace') return replace(day, Number(c.index) || 0)
-      if (c.type === 'social_send') return resend(day)
-      throw new Error('أمر غير معروف')
+      const job = c.type === 'social_generate' ? () => generate(day, { send: c.send !== false }) : c.type === 'social_replace' ? () => replace(day, Number(c.index) || 0) : c.type === 'social_send' ? () => resend(day) : null
+      if (!job) throw new Error('أمر غير معروف')
+      if (busy) throw new Error('التجهيز شغال — استنى شوي')
+      // الشغل بياخد دقايق على الجوال (تصميم + رفع + تيليجرام) ← بنرد فوراً وبنكمّل بالخلفية
+      const state = (x) => cfgRef.set({ run: { type: c.type, day, index: c.index ?? null, at: Date.now(), ...x } }, { merge: true }).catch(() => {})
+      await state({ state: 'working', error: null })
+      job()
+        .then(() => state({ state: 'done' }))
+        .catch((e) => (log('⚠️ منشورات اليوم:', e.message), state({ state: 'error', error: e.message })))
+      return { started: true }
     },
   }
 }
