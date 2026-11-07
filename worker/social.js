@@ -1,17 +1,14 @@
 // ============================================================
 //  منشورات اليوم لفيسبوك/إنستغرام
-//  كل يوم (الساعة 8 الصبح افتراضياً) بيختار 3 منتجات، بيصمم صورة منشور
-//  وستوري لكل واحد، بيكتب النص (عربي وتحته إنجليزي)، بيرفع الصور
+//  كل يوم (الساعة 8 الصبح افتراضياً) بيختار 3 منتجات، بياخد صورهم الأصلية،
+//  بيكتب الوصف (عربي وتحته إنجليزي، بدون سعر — السعر عالموقع أو عالخاص)،
 //  وبيبعتهم على تيليجرام. اللوحة بتعرضهم بصفحة «منشورات اليوم».
 //  الإعدادات: store/social · المنشورات: store_social/{يوم}
 // ============================================================
-import fs from 'node:fs'
-import path from 'node:path'
-import { db, FieldValue, ROOT, dayKey } from './common.js'
+import { db, FieldValue, dayKey } from './common.js'
 import { translateTexts } from './translate.js'
-import { uploadGithub } from './shopImport.js'
 import { storeBase } from './catalog.js'
-import { postSvg, storySvg, captions, mergeSocial, cleanText } from './socialDesign.js'
+import { captions, mergeSocial, cleanText } from './socialDesign.js'
 
 const TZ = 'Africa/Cairo'
 const cfgRef = db.doc('store/social')
@@ -33,32 +30,6 @@ const addDays = (key, n) => {
   const t = new Date(Date.UTC(y, m - 1, d + n))
   return t.toISOString().slice(0, 10)
 }
-
-// ---------- الرسم (resvg) — لو مش مثبّت بنبعت صورة المنتج الأصلية ----------
-let resvg = null
-let resvgTried = false
-async function getResvg(log) {
-  if (resvgTried) return resvg
-  resvgTried = true
-  try {
-    resvg = (await import('@resvg/resvg-js')).Resvg
-  } catch (e) {
-    log('ℹ️ مكتبة التصميم (resvg) مش مثبتة — المنشورات بتطلع بصورة المنتج الأصلية لحد ما تتثبت:', e.message)
-  }
-  return resvg
-}
-const FONT_DIR = path.join(ROOT, 'tools', 'fonts')
-const fontFiles = () => (fs.existsSync(FONT_DIR) ? fs.readdirSync(FONT_DIR).filter((f) => /\.(ttf|otf)$/i.test(f)).map((f) => path.join(FONT_DIR, f)) : [])
-function render(svg) {
-  return Buffer.from(new resvg(svg, { font: { fontFiles: fontFiles(), loadSystemFonts: false, defaultFontFamily: 'Cairo' }, fitTo: { mode: 'original' } }).render().asPng())
-}
-
-async function fetchBuf(url, timeout = 30_000) {
-  const r = await fetch(url, { signal: AbortSignal.timeout(timeout) })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return { buf: Buffer.from(await r.arrayBuffer()), type: r.headers.get('content-type') || 'image/jpeg' }
-}
-const dataUri = ({ buf, type }) => `data:${type.split(';')[0]};base64,${buf.toString('base64')}`
 
 // ---------- تيليجرام: صور + نص ----------
 async function tg(method, token, body, isForm = false) {
@@ -87,21 +58,10 @@ async function sendAlbum(token, chatId, photos, caption) {
 export function createSocial({ settings, log, event }) {
   let cfg = mergeSocial()
   let busy = false
-  let logoCache = null
 
   const loadCfg = async () => (cfg = mergeSocial((await cfgRef.get()).data() || {}))
   const loadPriv = async () => (await db.doc('store/settings').get()).data() || {}
   const loadPub = async () => (await db.doc('store/public').get()).data() || {}
-
-  async function logo(priv) {
-    if (logoCache !== null) return logoCache
-    try {
-      logoCache = dataUri(await fetchBuf(storeBase(priv) + 'logo-192.png', 20_000))
-    } catch {
-      logoCache = ''
-    }
-    return logoCache
-  }
 
   // ---------- اختيار المنتجات ----------
   async function pickProducts(day, count, exclude = []) {
@@ -142,19 +102,20 @@ export function createSocial({ settings, log, event }) {
 
   // ترجمة الاسم والمميزات للإنجليزي لو ناقصين (وبنحفظهم بالمنتج)
   async function ensureEnglish(p) {
-    const feats = (p.features || []).slice(0, 4)
+    const feats = (p.features || []).slice(0, 5)
+    const desc = cleanText(p.desc || '').slice(0, 600)
     const needName = !p.nameEn || isArabic(p.nameEn)
-    const needFeats = feats.length && (!(p.featuresEn || []).length || (p.featuresEn || []).some(isArabic))
-    if (!needName && !needFeats) return p
+    const needFeats = feats.length > 0 && (!(p.featuresEn || []).length || (p.featuresEn || []).some(isArabic))
+    const needDesc = !!desc && (!p.descEn || isArabic(p.descEn))
+    if (!needName && !needFeats && !needDesc) return p
     try {
-      const src = [needName ? p.name : null, ...(needFeats ? feats : [])].filter((x) => x != null)
-      const out = await translateTexts(src.map(cleanText), 'en', 'ar')
+      const src = [needName ? cleanText(p.name) : '-', needDesc ? desc : '-', ...(needFeats ? feats.map(cleanText) : [])]
+      const out = await translateTexts(src, 'en', 'ar')
       const patch = {}
-      let k = 0
-      if (needName && out[k] && !isArabic(out[k])) patch.nameEn = out[k]
-      if (needName) k++
+      if (needName && out[0] && !isArabic(out[0])) patch.nameEn = out[0]
+      if (needDesc && out[1] && !isArabic(out[1])) patch.descEn = out[1]
       if (needFeats) {
-        const fe = out.slice(k).filter((x) => x && !isArabic(x))
+        const fe = out.slice(2).filter((x) => x && !isArabic(x))
         if (fe.length) patch.featuresEn = fe
       }
       if (Object.keys(patch).length) {
@@ -167,56 +128,29 @@ export function createSocial({ settings, log, event }) {
     return p
   }
 
-  // ---------- تجهيز منشور واحد ----------
+  // ---------- تجهيز منشور واحد: صور المنتج الأصلية + وصف بدون سعر ----------
   async function buildItem(p, { day, priv, pub, seed }) {
     p = await ensureEnglish(p)
     const now = Date.now()
-    const flash = Number(p.flashUntil) > now && Number(p.flashPrice) > 0 && Number(p.flashPrice) < Number(p.price)
-    const view = { ...p, price: flash ? Number(p.flashPrice) : Number(p.price), oldPrice: flash ? Number(p.price) : Number(p.oldPrice) || 0 }
     const kind = now - ms(p.createdAt) < 14 * 86_400_000 ? 'new' : ''
     const link = `${storeBase(priv)}#/p/${encodeURIComponent(p.id)}`
-    const { fb, ig } = captions({ p: view, link, settings: pub, seed })
-    const item = { pid: p.id, name: p.name, nameEn: p.nameEn || '', price: view.price, oldPrice: view.oldPrice, category: p.category || '', kind, link, fb, ig, posted: false, photo: p.images[0], post: '', story: '' }
-    const R = await getResvg(log)
-    if (!R || !fontFiles().length) return { item, files: null }
-    // صورة المنتج (لو الأولى ما فتحت منجرب اللي بعدها)
-    let photo = null
-    for (const u of (p.images || []).slice(0, 3)) {
-      try {
-        photo = await fetchBuf(u)
-        break
-      } catch {}
-    }
-    if (!photo) return { item, files: null }
-    const img = dataUri(photo)
-    const lg = await logo(priv)
-    const storeName = pub.nameEn || 'Joudi Store'
-    const delivery = 'توصيل لكل الضفة والقدس والداخل · الدفع عند الاستلام'
-    const postPng = render(postSvg({ p: view, img, logo: lg, storeName, kind }))
-    const storyPng = render(storySvg({ p: view, img, logo: lg, storeName, kind, features: p.features || [], delivery }))
-    const stamp = Date.now().toString(36)
-    const safe = p.id.replace(/[^\w-]/g, '_')
-    try {
-      item.post = await uploadGithub(priv, `img/social/${day}/${safe}-${stamp}-post.png`, postPng, log)
-      item.story = await uploadGithub(priv, `img/social/${day}/${safe}-${stamp}-story.png`, storyPng, log)
-    } catch (e) {
-      log('⚠️ رفع صور المنشور:', e.message)
-    }
-    return { item, files: { post: postPng, story: storyPng } }
+    const { fb, ig } = captions({ p, link, settings: pub, seed })
+    const photos = (p.images || []).filter(Boolean).slice(0, 10)
+    const item = { pid: p.id, name: p.name, nameEn: p.nameEn || '', price: Number(p.price) || 0, oldPrice: Number(p.oldPrice) || 0, category: p.category || '', kind, link, fb, ig, posted: false, photos, photo: photos[0] || '' }
+    return { item, files: null }
   }
 
   async function sendTelegram(day, items, files = []) {
     const n = settings.app.notify || {}
     if (!n.enabled || !n.botToken || !n.chatId) return false
     const [, m, d] = day.split('-').map(Number)
-    await tg('sendMessage', n.botToken, { chat_id: n.chatId, text: `📣 منشورات اليوم ${d}/${m} جاهزة (${items.length})\nلكل منتج: صورة المنشور + الستوري، وتحتهم نص فيسبوك ونص إنستغرام — احفظ الصورة وانسخ النص وانشر 👇` })
+    await tg('sendMessage', n.botToken, { chat_id: n.chatId, text: `📣 منشورات اليوم ${d}/${m} جاهزة (${items.length})\nلكل منتج: صوره، وتحتها نص فيسبوك ونص إنستغرام — احفظ الصور وانسخ النص وانشر 👇` })
     for (let i = 0; i < items.length; i++) {
       const it = items[i]
-      const f = files[i]
-      const photos = f ? [{ buf: f.post }, { buf: f.story }] : it.post ? [{ url: it.post }, { url: it.story }] : [{ url: it.photo }]
+      const photos = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean).slice(0, 10).map((url) => ({ url }))
       try {
         if (photos.length > 1) await sendAlbum(n.botToken, n.chatId, photos, `${i + 1}/${items.length} · ${it.name}`)
-        else await tg('sendPhoto', n.botToken, { chat_id: n.chatId, photo: photos[0].url, caption: `${i + 1}/${items.length} · ${it.name}` })
+        else if (photos.length) await tg('sendPhoto', n.botToken, { chat_id: n.chatId, photo: photos[0].url, caption: `${i + 1}/${items.length} · ${it.name}` })
       } catch (e) {
         log('⚠️ صور المنشور على تيليجرام:', e.message)
       }
@@ -242,14 +176,13 @@ export function createSocial({ settings, log, event }) {
         items.push(r.item)
         files.push(r.files)
       }
-      const designed = items.every((x) => x.post)
-      await dayCol.doc(day).set({ day, items, designed, createdAt: FieldValue.serverTimestamp(), sentAt: null })
+      await dayCol.doc(day).set({ day, items, createdAt: FieldValue.serverTimestamp(), sentAt: null })
       log(`📣 منشورات ${day} جاهزة: ${items.map((x) => x.name).join(' · ')}`)
       if (send) {
         const ok = await sendTelegram(day, items, files).catch((e) => (log('⚠️ إرسال المنشورات:', e.message), false))
         if (ok) await dayCol.doc(day).update({ sentAt: FieldValue.serverTimestamp() })
       }
-      return { items: items.length, designed }
+      return { items: items.length }
     } finally {
       busy = false
     }
@@ -270,7 +203,7 @@ export function createSocial({ settings, log, event }) {
       const { item } = await buildItem(p, { day, priv, pub, seed: Date.now() % 97 })
       const items = [...doc.items]
       items[index] = item
-      await ref.update({ items, designed: items.every((x) => x.post) })
+      await ref.update({ items })
       return { name: item.name }
     } finally {
       busy = false

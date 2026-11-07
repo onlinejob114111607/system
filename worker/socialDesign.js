@@ -177,38 +177,46 @@ const HOOKS_AR = [
   'الكل عم يسأل عنه 😍',
   'فكرة هدية مميزة 🎁',
   'جودة ممتازة وسعر بيناسبك 💯',
-  'لا تفوّت العرض ⏳',
+  'اختيار مميز لبيتك 🏡',
   'رتّب بيتك بلمسة حلوة ✨',
 ]
-const HOOKS_EN = ['Make life easier 👌', 'Just arrived at a great price 🔥', 'Everyone is asking about it 😍', 'A perfect gift idea 🎁', 'Great quality, fair price 💯', "Don't miss this deal ⏳", 'Add a lovely touch to your home ✨']
+const HOOKS_EN = ['Make life easier 👌', 'Just arrived at a great price 🔥', 'Everyone is asking about it 😍', 'A perfect gift idea 🎁', 'Great quality, fair price 💯', 'A special pick for your home 🏡', 'Add a lovely touch to your home ✨']
 const tagify = (s) => '#' + cleanText(s).replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_|_$/g, '')
 
+const shortDesc = (t, max = 320) => {
+  const s = cleanText(t)
+  if (s.length <= max) return s
+  const cut = s.slice(0, max)
+  const end = Math.max(cut.lastIndexOf('.'), cut.lastIndexOf('،'), cut.lastIndexOf('!'))
+  return (end > 120 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…').trim()
+}
+
+// بدون سعر: السعر عالموقع أو عالخاص
 export function captions({ p, link, settings = {}, seed = 0 }) {
   const i = Math.abs(seed) % HOOKS_AR.length
-  const off = Number(p.oldPrice) > Number(p.price)
-  const feats = (p.features || []).map(cleanText).filter(Boolean).slice(0, 4)
-  const featsEn = (p.featuresEn || []).map(cleanText).filter(Boolean).slice(0, 4)
-  const cur = settings.currency || '₪'
+  const feats = (p.features || []).map(cleanText).filter(Boolean).slice(0, 5)
+  const featsEn = (p.featuresEn || []).map(cleanText).filter((x) => x && !isArabic(x)).slice(0, 5)
+  const desc = p.desc ? shortDesc(p.desc) : ''
+  const descEn = p.descEn && !isArabic(p.descEn) ? shortDesc(p.descEn) : ''
   const ar = [
     `✨ ${cleanText(p.name)}`,
     HOOKS_AR[i],
+    ...(desc ? ['', desc] : []),
+    ...(feats.length ? ['', ...feats.map((f) => `✅ ${f}`)] : []),
     '',
-    ...feats.map((f) => `✅ ${f}`),
-    feats.length ? '' : null,
-    `💰 السعر: ${fmtPrice(p.price)} ${cur}${off ? ` بدل ${fmtPrice(p.oldPrice)} ${cur}` : ''}`,
-    `🚚 توصيل لكل الضفة والقدس والداخل · الدفع عند الاستلام`,
-  ].filter((x) => x !== null)
+    '🚚 توصيل لكل الضفة والقدس والداخل · الدفع عند الاستلام',
+  ]
   const en = [
-    `✨ ${cleanText(p.nameEn || p.name)}`,
+    `✨ ${cleanText(p.nameEn && !isArabic(p.nameEn) ? p.nameEn : p.name)}`,
     HOOKS_EN[i],
+    ...(descEn ? ['', descEn] : []),
     ...(featsEn.length ? ['', ...featsEn.map((f) => `✅ ${f}`)] : []),
     '',
-    `💰 Price: ${fmtPrice(p.price)} ILS${off ? ` (was ${fmtPrice(p.oldPrice)})` : ''}`,
-    `🚚 Delivery to the West Bank, Jerusalem & 48 · Cash on delivery`,
+    '🚚 Delivery to the West Bank, Jerusalem & 48 · Cash on delivery',
   ]
   const storeTag = tagify(settings.name || 'جودي ستور')
   const tags = [storeTag, '#JoudiStore', p.category ? tagify(p.category) : '', '#تسوق_اونلاين', '#الدفع_عند_الاستلام', '#فلسطين', '#الضفة', '#القدس', '#الداخل'].filter(Boolean)
-  const fb = [...ar, `🛒 اطلب الآن: ${link}`, '', '—', '', ...en, `🛒 Order now: ${link}`, '', tags.slice(0, 6).join(' ')].join('\n')
-  const ig = [...ar, '🛒 للطلب: الرابط بالبايو أو راسلنا', '', '—', '', ...en, '🛒 Order: link in bio or DM us', '', [...tags, '#instashop', '#onlineshopping', '#palestine', '#shopping'].join(' ')].join('\n')
+  const fb = [...ar, `💬 السعر عالموقع أو راسلنا عالخاص`, `🛒 ${link}`, '', '—', '', ...en, '💬 Price on our website or DM us', `🛒 ${link}`, '', tags.slice(0, 6).join(' ')].join('\n')
+  const ig = [...ar, '💬 السعر عالخاص أو من الرابط بالبايو', '', '—', '', ...en, '💬 Price via DM or the link in bio', '', [...tags, '#instashop', '#onlineshopping', '#palestine', '#shopping'].join(' ')].join('\n')
   return { fb, ig }
 }
