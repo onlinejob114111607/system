@@ -5,7 +5,7 @@
 //  وبيبعتهم على تيليجرام. اللوحة بتعرضهم بصفحة «منشورات اليوم».
 //  الإعدادات: store/social · المنشورات: store_social/{يوم}
 // ============================================================
-import { db, FieldValue, dayKey } from './common.js'
+import { db, FieldValue, Timestamp, dayKey } from './common.js'
 import { translateTexts } from './translate.js'
 import { storeBase } from './catalog.js'
 import { captions, mergeSocial, cleanText } from './socialDesign.js'
@@ -178,6 +178,7 @@ export function createSocial({ settings, log, event }) {
       }
       await dayCol.doc(day).set({ day, items, createdAt: FieldValue.serverTimestamp(), sentAt: null })
       log(`📣 منشورات ${day} جاهزة: ${items.map((x) => x.name).join(' · ')}`)
+      await queueWaPosts(day, items).catch((e) => log('⚠️ منشورات المتجر للمجموعات:', e.message))
       if (send) {
         const ok = await sendTelegram(day, items, files).catch((e) => (log('⚠️ إرسال المنشورات:', e.message), false))
         if (ok) await dayCol.doc(day).update({ sentAt: FieldValue.serverTimestamp() })
@@ -186,6 +187,67 @@ export function createSocial({ settings, log, event }) {
     } finally {
       busy = false
     }
+  }
+
+  // ---------- نشر منتجات اليوم بمجموعات الواتساب (موزعة على اليوم) ----------
+  const cairoAt = (day, hm) => {
+    // وقت hh:mm بتوقيت مصر بهاليوم ← ملي ثانية
+    const [y, m, d] = day.split('-').map(Number)
+    const [h, mi] = hm.split(':').map(Number)
+    const guess = Date.UTC(y, m - 1, d, h, mi)
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(guess)).map((p) => [p.type, p.value]))
+    const shown = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute)
+    return guess - (shown - guess)
+  }
+  async function queueWaPosts(day, items) {
+    if (!cfg.waOn || !cfg.waCategory || !items.length) return 0
+    const posts = db.collection('wa_posts')
+    // لو انجهزوا من جديد: بنلغي المجدول القديم لهاليوم
+    const old = await posts.where('socialDay', '==', day).get()
+    const started = new Set() // منتجات انتشرت أو عم تنتشر ← ما منكررها
+    for (const d of old.docs) {
+      if (['scheduled', 'queued'].includes(d.data().status)) await d.ref.delete().catch(() => {})
+      else started.add(d.data().socialPid)
+    }
+    const accs = (await db.collection('wa_accounts').get()).docs.filter((d) => d.data().enabled !== false && (!cfg.waAccounts.length || cfg.waAccounts.includes(d.id)))
+    if (!accs.length) return 0
+    const times = cfg.waTimes.length ? cfg.waTimes : ['10:00', '15:00', '20:00']
+    // الأوقات: لو وقت فات بنحطه بعد شوي، وبنضمن ساعة على الأقل بين كل منشور والتاني
+    const slots = items.map((_, i) => Math.max(cairoAt(day, times[i % times.length]), Date.now() + 15 * 60_000))
+    const order = slots.map((t, i) => [t, i]).sort((a, b) => a[0] - b[0])
+    for (let k = 1; k < order.length; k++) order[k][0] = Math.max(order[k][0], order[k - 1][0] + 60 * 60_000)
+    order.forEach(([t, i]) => (slots[i] = t))
+    let n = 0
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i]
+      if (started.has(it.pid)) continue
+      const at = slots[i]
+      for (const a of accs) {
+        await posts.add({
+          accountId: a.id,
+          text: it.fb,
+          variants: [],
+          target: 'category',
+          category: cfg.waCategory,
+          regions: cfg.waRegions,
+          includeUnknown: false,
+          mentionAll: !!cfg.waMention,
+          images: (it.photos || [it.photo]).filter(Boolean).slice(0, 1),
+          track: false,
+          status: 'scheduled',
+          scheduledAt: Timestamp.fromMillis(at + Math.floor(Math.random() * 10) * 60_000),
+          socialDay: day,
+          socialPid: it.pid,
+          sent: 0,
+          failed: 0,
+          total: 0,
+          createdAt: FieldValue.serverTimestamp(),
+        })
+        n++
+      }
+    }
+    log(`📣 انجدول ${n} منشور للمتجر بمجموعات «${cfg.waCategory}»`)
+    return n
   }
 
   // تبديل منتج واحد
@@ -204,6 +266,7 @@ export function createSocial({ settings, log, event }) {
       const items = [...doc.items]
       items[index] = item
       await ref.update({ items })
+      await queueWaPosts(day, items).catch((e) => log('⚠️ منشورات المتجر للمجموعات:', e.message))
       return { name: item.name }
     } finally {
       busy = false

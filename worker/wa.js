@@ -35,6 +35,7 @@ import { createFunnel } from './funnel.js'
 import { createStore } from './store.js'
 import { buildDailyReport, selfUpdate, startDailyReport } from './report.js'
 import { createSocial } from './social.js'
+import { regionOf, autoCategory, PS_NAME_RE } from './groupIntel.js'
 
 // مكتبة التشفير بتطبع تفاصيل الجلسات على الشاشة — بنسكتها (سجلنا بيكتب مباشرة على stdout)
 console.log = console.info = console.debug = console.warn = console.error = () => {}
@@ -174,6 +175,69 @@ async function reportLink(code, accountId, s, e = null) {
 // ============================================================
 //  حساب واتساب واحد
 // ============================================================
+// الساعة الجاية (بتوقيت مصر) — خلال 24 ساعة
+function nextCairoHour(h) {
+  const now = new Date()
+  const cairoH = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', hour: '2-digit', hourCycle: 'h23' }).format(now))
+  const cairoM = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', minute: '2-digit' }).format(now))
+  let diffH = (Number(h) - cairoH + 24) % 24
+  if (diffH === 0 && cairoM > 40) diffH = 24
+  const at = now.getTime() + diffH * 3_600_000 - cairoM * 60_000 + Math.floor(Math.random() * 20) * 60_000
+  return Math.max(at, Date.now())
+}
+
+// أفضل ساعة لكل تصنيف (بتنحسب كل 3 أيام من الضغطات والتسجيلات)
+let bestCache = { at: 0, data: null }
+async function bestHours() {
+  if (Date.now() - bestCache.at < 3 * 3_600_000 && bestCache.data) return bestCache.data
+  const ref = db.doc('wa_stats/best_hours')
+  let data = (await ref.get().catch(() => null))?.data() || null
+  if (!data || Date.now() - (data.at || 0) > 3 * 86_400_000) {
+    data = await computeBestHours().catch((e) => (log('⚠️ أفضل وقت:', e.message), data))
+    if (data) await ref.set(data).catch(() => {})
+  }
+  bestCache = { at: Date.now(), data }
+  return data
+}
+async function computeBestHours() {
+  const hourOf = (t) => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', hour: '2-digit', hourCycle: 'h23' }).format(new Date(t)))
+  const catOf = new Map()
+  ;(await groupsCol.get()).docs.forEach((d) => d.data().k && catOf.set(d.data().k, d.data().category || 'عام'))
+  const acc = {}
+  const add = (cat, h, w) => {
+    for (const c of [cat, '__all']) {
+      const e = (acc[c] ||= { hours: {}, samples: 0 })
+      e.hours[h] = (e.hours[h] || 0) + w
+      e.samples += w
+    }
+  }
+  for (const d of (await db.collection('track_clicks').get()).docs) {
+    const c = d.data()
+    const t = ms(c.at)
+    if (t) add(catOf.get(c.gk) || 'عام', hourOf(t), Math.min(5, c.n || 1))
+  }
+  const since = Timestamp.fromMillis(Date.now() - 30 * 86_400_000)
+  for (const d of (await db.collection('registrations').where('createdAt', '>=', since).get()).docs) {
+    const r = d.data()
+    const m = /^[a-z0-9]{6}-([a-z0-9]{6})$/.exec(r.utm || '')
+    if (m && ms(r.createdAt)) add(catOf.get(m[1]) || 'عام', hourOf(ms(r.createdAt)), 3)
+  }
+  const pick = (e) => {
+    // ساعة الذروة (مع جيرانها عشان ما تتأثر بالصدفة)
+    let best = null
+    let bestV = -1
+    for (let h = 0; h < 24; h++) {
+      const v = (e.hours[h] || 0) * 2 + (e.hours[(h + 23) % 24] || 0) + (e.hours[(h + 1) % 24] || 0)
+      if (v > bestV) (bestV = v), (best = h)
+    }
+    return e.samples >= 8 ? best : null
+  }
+  const byCat = {}
+  for (const [c, e] of Object.entries(acc)) if (c !== '__all') byCat[c] = { hour: pick(e), samples: e.samples, hours: e.hours }
+  const all = acc.__all ? { hour: pick(acc.__all), samples: acc.__all.samples, hours: acc.__all.hours } : null
+  return { byCat, all, at: Date.now() }
+}
+
 class Account {
   constructor(id, data) {
     this.id = id
@@ -193,6 +257,10 @@ class Account {
     this.limitLoggedDay = null
     this.tried = new Set()
     this.myIds = new Set()
+    this.lastPosted = new Map() // jid -> آخر مرة نشرنا فيها (لتنبيه الردود)
+    this.replySeen = new Map() // jid|sender -> آخر تنبيه
+    this.riskLog = [] // [وقت، نوع] آخر 24 ساعة
+    this.risk = data.risk || null
     // تنظيف المجموعات (مغلقة / انطردت منها)
     this.lastMsg = new Map() // jid -> آخر رسالة بالمجموعة (لازمة لحذف المحادثة)
     this.cleanQ = []
@@ -246,9 +314,10 @@ class Account {
 
   postLimit() {
     const lim = this.settings.dailyLimit
-    if (this.settings.warmup) return Math.max(1, Math.round((lim > 0 ? lim : 150) * this.warmFactor()))
-    if (settings.app.wa.postUnlimited || lim <= 0) return Infinity
-    return lim
+    const rf = this.riskFactor()
+    if (this.settings.warmup) return Math.max(1, Math.round((lim > 0 ? lim : 150) * this.warmFactor() * rf))
+    if (settings.app.wa.postUnlimited || lim <= 0) return rf < 1 ? 150 : Infinity
+    return Math.max(1, Math.round(lim * rf))
   }
 
   rollDays() {
@@ -298,7 +367,96 @@ class Account {
     if (lim <= 0) return false
     const since = Date.now() - 3_600_000
     this.sentTimes = (this.sentTimes || []).filter((t) => t > since)
-    return this.sentTimes.length >= Math.max(1, Math.round(lim * this.warmFactor()))
+    return this.sentTimes.length >= Math.max(1, Math.round(lim * this.warmFactor() * this.riskFactor()))
+  }
+
+  // ---------- مقياس خطر الحظر (آخر 24 ساعة) ----------
+  noteRisk(kind) {
+    const t = Date.now()
+    this.riskLog.push([t, kind])
+    this.riskLog = this.riskLog.filter(([x]) => x > t - 86_400_000)
+  }
+  riskScore() {
+    const c = (k) => this.riskLog.filter(([, x]) => x === k).length
+    const sent = c('sent')
+    const fail = c('fail')
+    const rate = c('rate')
+    const pause = c('pause')
+    const drop = c('drop')
+    const failRate = sent + fail ? fail / (sent + fail) : 0
+    let s = 0
+    const why = []
+    if (fail >= 3 && failRate > 0.05) {
+      s += Math.min(40, Math.round(failRate * 100))
+      why.push(`فشل ${Math.round(failRate * 100)}%`)
+    }
+    if (rate) (s += Math.min(30, rate * 15)), why.push(`واتساب طلب تهدئة ${rate} مرة`)
+    if (pause) (s += Math.min(30, pause * 20)), why.push(`إيقاف تلقائي ${pause} مرة`)
+    if (drop >= 2) (s += Math.min(20, drop * 4)), why.push(`انقطع ${drop} مرة`)
+    if (this.settings.warmup && this.warmFactor() < 1) (s += 10), why.push('رقم بفترة التسخين')
+    s = Math.min(100, s)
+    return { score: s, level: s >= 80 ? 'danger' : s >= 60 ? 'high' : s >= 30 ? 'medium' : 'low', why }
+  }
+  riskFactor() {
+    if (settings.app.wa.riskThrottle === false) return 1
+    return (this.risk?.score || 0) >= 60 ? 0.5 : 1
+  }
+  async saveRisk() {
+    const r = this.riskScore()
+    const prev = this.risk
+    this.risk = r
+    if (!prev || prev.score !== r.score) await this.set({ risk: { ...r, at: Date.now() } })
+    if (r.score >= 60 && (!prev || prev.score < 60)) notifier.notify('accountIssues', `⚠️ [${this.label}] خطر الحظر صار ${r.score}/100 (${r.why.join('، ')}) — خففت النشر للنص لحماية الرقم`)
+    if (r.score >= 80 && settings.app.wa.riskThrottle !== false && !this.paused() && Date.now() - (this.riskPausedAt || 0) > 6 * 3_600_000) {
+      this.riskPausedAt = Date.now()
+      await this.autoPause(`خطر الحظر عالي (${r.score}/100): ${r.why.join('، ')}`)
+    }
+  }
+
+  // أعضاء المجموعة (لمنشن الكل)
+  async membersOf(jid) {
+    let meta = this.participating.get(jid)
+    if (!meta?.participants?.length) {
+      meta = await this.sock.groupMetadata(jid).catch(() => null)
+      if (meta) this.participating.set(jid, meta)
+    }
+    return (meta?.participants || []).map((p) => p.id).filter(Boolean).slice(0, 1024)
+  }
+
+  // ---------- تنبيه الردود على منشوراتنا ----------
+  async checkReplies(u) {
+    if (settings.app.wa.replyAlerts === false || u.type !== 'notify') return
+    const ASK_RE = /(كم السعر|بكم|بقديش|قديش|كم سعر|السعر|سعره|سعرها|الاسعار|الأسعار|بدي اطلب|بدي أطلب|بدي اسجل|بدي أسجل|كيف (بسجل|اسجل|أسجل|التسجيل|بطلب|اطلب|أطلب)|التفاصيل|تفاصيل|ممكن رقم|الرابط|بالخاص|خاص|price|how much)/i
+    const norm = (x) => String(x || '').split(':')[0].split('@')[0]
+    for (const m of u.messages || []) {
+      const jid = m.key?.remoteJid
+      if (!jid?.endsWith('@g.us') || m.key.fromMe || !m.message) continue
+      const msg = m.message
+      const body = msg.extendedTextMessage || msg.imageMessage || msg.videoMessage || msg.documentMessage || null
+      const ctx = body?.contextInfo || null
+      const text = String(msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || '').trim()
+      const replyToMe = !!ctx?.participant && this.myIds.has(norm(ctx.participant))
+      const mentioned = (ctx?.mentionedJid || []).some((j) => this.myIds.has(norm(j)))
+      const recent = (this.lastPosted.get(jid) || 0) > Date.now() - 3 * 3_600_000
+      const asking = recent && text && ASK_RE.test(text)
+      if (!replyToMe && !mentioned && !asking) continue
+      const cands = [m.key.participantPn, m.key.participantAlt, m.key.participant, m.participant].filter(Boolean)
+      const pn = cands.find((x) => String(x).endsWith('@s.whatsapp.net'))
+      const phone = pn ? norm(pn) : ''
+      const sender = phone || norm(cands[0])
+      const key = `${jid}|${sender}`
+      if ((this.replySeen.get(key) || 0) > Date.now() - 30 * 60_000) continue
+      this.replySeen.set(key, Date.now())
+      const group = this.participating.get(jid)?.subject || 'مجموعة'
+      const kind = replyToMe ? 'رد على منشورك' : mentioned ? 'منشن إلك' : 'سؤال بعد منشورك'
+      const who = m.pushName || 'شخص'
+      await db
+        .collection('wa_replies')
+        .add({ accountId: this.id, account: this.label, jid, group, name: who, phone: phone || null, text: text.slice(0, 500), kind, at: FieldValue.serverTimestamp() })
+        .catch(() => {})
+      notifier.notify('replies', `💬 ${kind} — ${group}\n👤 ${who}${phone ? ` +${phone}` : ''}\n«${text.slice(0, 300) || '[صورة/ملف]'}»${phone ? `\n📲 https://wa.me/${phone}` : ''}\n📱 الرقم: ${this.label}`)
+      this.log(`💬 ${kind} من ${who} بـ ${group}`)
+    }
   }
 
   paused() {
@@ -310,6 +468,7 @@ class Account {
     const until = Date.now() + hours * 3_600_000
     this.data = { ...this.data, postPausedUntil: Timestamp.fromMillis(until), postPauseWhy: why }
     await this.set({ postPausedUntil: Timestamp.fromMillis(until), postPauseWhy: why })
+    this.noteRisk('pause')
     this.event('warn', `🛑 النشر وقف ${hours} ساعة لحماية الرقم: ${why}`)
     notifier.notify('accountIssues', `🛑 [${this.label}] وقّفت النشر ${hours} ساعة لحماية الرقم من الحظر\nالسبب: ${why}\nبيرجع يكمّل لحاله بعدها.`)
   }
@@ -363,6 +522,7 @@ class Account {
         await this.set({ state: 'open', qr: null, pairingCode: null, phone, waName: sock.user?.name || null, error: null })
         await this.refreshParticipating()
         this.pumpAll()
+        setTimeout(() => this.connected && this.regionPass().catch((e) => this.log('⚠️ بلد المجموعات:', e.message)), 120_000)
         if (!this.muteScanned && settings.app.wa.muteGroups) this.pumpMutes()
         if (!this.cleanScanned && settings.app.wa.autoClean) setTimeout(() => this.connected && this.cleanScan(), 90_000)
       }
@@ -378,6 +538,7 @@ class Account {
           setTimeout(() => this.connect(), 3000)
         } else {
           this.log('🔌 انقطع، إعادة المحاولة...', code ?? '')
+          this.noteRisk('drop')
           await this.set({ state: 'reconnecting' })
           setTimeout(() => this.connect(), code === DisconnectReason.restartRequired ? 500 : 5000)
         }
@@ -391,6 +552,7 @@ class Account {
         const j = m.key?.remoteJid
         if (j?.endsWith('@g.us') && m.key.id && m.messageTimestamp) this.lastMsg.set(j, { key: { ...m.key }, messageTimestamp: m.messageTimestamp })
       }
+      this.checkReplies(u).catch(() => {})
       funnel.onUpsert(this, u).catch((e) => this.log('⚠️ متابعة:', e.message))
       shop.onUpsert(this, u).catch((e) => this.log('⚠️ المتجر:', e.message))
     })
@@ -655,6 +817,7 @@ class Account {
         announce: !!meta.announce,
         status: 'joined',
         error: null,
+        ...(meta.participants?.length ? regionOf(meta.participants) : {}),
       }
       const existing = byJid.get(jid)
       if (existing) batch.update(existing.ref, data)
@@ -666,7 +829,7 @@ class Account {
           inviteCode: null,
           linkCode: null,
           k: randomKey(),
-          category: 'عام',
+          category: (settings.app.wa.autoCategory !== false && autoCategory(meta.subject)) || 'عام',
           enabled: true,
           failCount: 0,
           source: 'sync',
@@ -788,7 +951,11 @@ class Account {
       if (res) {
         this.participating.set(jid, info)
         const muted = settings.app.wa.muteGroups ? (await this.muteJid(jid)) === true : false
-        await doc.ref.update({ ...base, status: 'joined', joinedAt: FieldValue.serverTimestamp(), ...(muted ? { muted: true, muteVer: MUTE_VER } : {}) })
+        const meta = await sleep(2500).then(() => this.sock.groupMetadata(jid)).catch(() => null)
+        if (meta) this.participating.set(jid, meta)
+        const cur = doc.data().category
+        const ac = settings.app.wa.autoCategory !== false && (!cur || cur === 'عام' || cur === HUNTER_CATEGORY) ? autoCategory(base.name) : null
+        await doc.ref.update({ ...base, status: 'joined', joinedAt: FieldValue.serverTimestamp(), ...(muted ? { muted: true, muteVer: MUTE_VER } : {}), ...(meta?.participants?.length ? regionOf(meta.participants) : {}), ...(ac ? { category: ac } : {}) })
         this.log(`➕ انضممت: ${base.name} (${this.joinCounter.joined}/${this.joinLimit()} اليوم)`)
         report('joined')
       } else {
@@ -840,6 +1007,9 @@ class Account {
       const set = new Set(post.groupIds || [])
       groups = groups.filter((d) => set.has(d.id))
     }
+    // بلد المجموعة (فلسطين، مصر...) — المجموعات اللي بلدها لسا مش معروف حسب الاختيار
+    const regs = Array.isArray(post.regions) ? post.regions.filter(Boolean) : []
+    if (regs.length) groups = groups.filter((d) => (d.data().region ? regs.includes(d.data().region) : post.includeUnknown !== false))
     return groups.sort(() => Math.random() - 0.5)
   }
 
@@ -850,8 +1020,20 @@ class Account {
 
   async buildText(post, gref, gd) {
     // تدوير النص: كل مجموعة بتاخد نسخة عشوائية (النص الأساسي + النسخ البديلة)
-    const variants = [post.text, ...(Array.isArray(post.variants) ? post.variants : [])].map((x) => String(x || '')).filter((x) => x.trim())
-    let text = variants.length ? variants[Math.floor(Math.random() * variants.length)] : ''
+    const variants = [post.text, ...(Array.isArray(post.variants) ? post.variants : [])].map((x) => String(x || ''))
+    const okIdx = variants.map((x, i) => (x.trim() ? i : -1)).filter((i) => i >= 0)
+    // اختبار A/B: لو في نسخة فايزة بتاخد 70% من المجموعات
+    const w = Array.isArray(post.variantWeights) && post.variantWeights.length === variants.length ? post.variantWeights : null
+    let vi = okIdx[Math.floor(Math.random() * okIdx.length)] ?? 0
+    if (w) {
+      let r = Math.random() * okIdx.reduce((a, i) => a + (Number(w[i]) || 0), 0)
+      for (const i of okIdx) if ((r -= Number(w[i]) || 0) <= 0) {
+        vi = i
+        break
+      }
+    }
+    this._vi = vi
+    let text = variants[vi] || ''
     const base = settings.app.siteUrl
     if (post.track && post.trackKey && base) {
       let k = gd.k
@@ -877,8 +1059,28 @@ class Account {
     })
     if (!claimed) return false
 
-    const post = (await ref.get()).data()
+    let post = (await ref.get()).data()
+    // اختبار A/B: بالتكرار اليومي بنشوف أي نسخة جابت ضغطات أكتر بالمرة اللي قبل
+    if (post.parentId && post.track && post.trackKey && (post.variants || []).some((x) => String(x || '').trim()) && !post.abChecked) {
+      const ab = await this.computeAB(post).catch(() => null)
+      const patch = { abChecked: true, ...(ab ? { ab } : {}) }
+      if (ab?.winner != null) {
+        const n = 1 + post.variants.length
+        patch.variantWeights = Array.from({ length: n }, (_, i) => (i === ab.winner ? 0.7 : 0.3 / Math.max(1, n - 1)))
+        if (!post.abNotified) {
+          patch.abNotified = true
+          notifier.notify('replies', `🏆 [${this.label}] اختبار النصوص: النسخة ${ab.winner + 1} جابت ضغطات أكتر (${ab.stats.map((x, i) => `ن${i + 1}: ${x.clicks}/${x.sent}`).join(' · ')}) — صارت تنبعت لـ 70% من المجموعات`)
+        }
+      }
+      await ref.update(patch).catch(() => {})
+      post = { ...post, ...patch }
+    }
     const targets = await this.resolveTargets(post)
+    // أفضل وقت: بنقسم المنشور حسب تصنيف المجموعات وبنجدول كل قسم على أحسن ساعة إله
+    if (post.bestTime && !post.splitFrom) {
+      await this.splitBestTime(ref, post, targets)
+      return true
+    }
     const done = new Set((await ref.collection('results').get()).docs.map((d) => d.id))
     await ref.update({ total: targets.length })
     this.log(`📝 منشور على ${targets.length} مجموعة`)
@@ -933,15 +1135,26 @@ class Account {
       }
       try {
         const text = await this.buildText(post, g.ref, gd)
+        const vi = this._vi ?? 0
+        // النص بيضل بخانة الكتابة («بيكتب...») كم ثانية قبل الإرسال
+        const typing = Math.max(0, Math.min(30, Number(settings.app.wa.typingSeconds ?? 5)))
         try {
           await this.sock.sendPresenceUpdate('composing', gd.jid)
-          await sleep(rand(2, 5) * 1000)
+          await sleep((typing + Math.random()) * 1000)
           await this.sock.sendPresenceUpdate('paused', gd.jid)
         } catch {}
-        const sentMsg = await this.sock.sendMessage(gd.jid, { text })
+        const img = Array.isArray(post.images) ? post.images.find(Boolean) : null
+        const content = img ? { image: { url: img }, caption: text } : { text }
+        if (post.mentionAll) {
+          const mentions = await this.membersOf(gd.jid).catch(() => [])
+          if (mentions.length) content.mentions = mentions
+        }
+        const sentMsg = await this.sock.sendMessage(gd.jid, content)
         if (sentMsg?.key?.id) this.lastMsg.set(gd.jid, { key: { ...sentMsg.key }, messageTimestamp: sentMsg.messageTimestamp || Math.floor(Date.now() / 1000) })
+        this.lastPosted.set(gd.jid, Date.now())
         this.countSent()
-        await ref.collection('results').doc(g.id).set({ groupName: gd.name, status: 'sent', at: FieldValue.serverTimestamp() })
+        this.noteRisk('sent')
+        await ref.collection('results').doc(g.id).set({ groupName: gd.name, status: 'sent', v: vi, gk: gd.k || null, at: FieldValue.serverTimestamp() })
         await ref.update({ sent: FieldValue.increment(1) })
         failStreak = 0
         await g.ref.update({ lastPostAt: FieldValue.serverTimestamp(), postCount: FieldValue.increment(1), ...(gd.failCount ? { failCount: 0, health: null } : {}) }).catch(() => {})
@@ -964,8 +1177,8 @@ class Account {
           if (fails >= 3) Object.assign(patch, { enabled: false, health: 'failing' })
           await g.ref.update(patch).catch(() => {})
         }
-        if (/rate/i.test(msg)) rateHits++
-        if (!isForbidden(msg)) failStreak++
+        if (/rate/i.test(msg)) (rateHits++, this.noteRisk('rate'))
+        if (!isForbidden(msg)) (failStreak++, this.noteRisk('fail'))
         // إيقاف تلقائي: فشل ورا بعض أو واتساب طلب تهدئة مرتين
         if (settings.app.wa.autoStop !== false && (failStreak >= Math.max(3, Number(settings.app.wa.stopAfterFails) || 6) || rateHits >= 2)) {
           await this.autoPause(rateHits >= 2 ? 'واتساب طلب تهدئة (rate limit) أكتر من مرة' : `${failStreak} رسائل فشلت ورا بعض`)
@@ -974,6 +1187,7 @@ class Account {
         } else if (/rate/i.test(msg)) await sleep(10 * 60_000)
       }
 
+      await this.saveRisk().catch(() => {})
       await sleep(rand(this.settings.minDelay, this.settings.maxDelay) * 1000)
     }
 
@@ -981,6 +1195,108 @@ class Account {
     await ref.update({ status: 'done', finishedAt: FieldValue.serverTimestamp(), note: null })
     this.event('ok', `🏁 خلص منشور (${targets.length} مجموعة)`)
 
+    await this.scheduleRepeat(ref, post)
+    return true
+  }
+
+  async computeAB(post) {
+    const res = await postsCol.doc(post.parentId).collection('results').where('status', '==', 'sent').get()
+    const clicks = new Map()
+    ;(await db.collection('track_clicks').where('pk', '==', post.trackKey).get()).docs.forEach((d) => clicks.set(d.data().gk, d.data().n || 0))
+    const n = 1 + (post.variants || []).length
+    const stats = Array.from({ length: n }, () => ({ sent: 0, clicks: 0 }))
+    for (const d of res.docs) {
+      const r = d.data()
+      if (r.v == null || !stats[r.v]) continue
+      stats[r.v].sent++
+      stats[r.v].clicks += clicks.get(r.gk) || 0
+    }
+    const live = stats.map((x, i) => ({ ...x, i, ctr: x.sent ? x.clicks / x.sent : 0 })).filter((x) => x.sent > 0)
+    let winner = null
+    if (live.length >= 2 && live.every((x) => x.sent >= 15)) {
+      const [a, b] = [...live].sort((x, y) => y.ctr - x.ctr)
+      if (a.clicks >= 5 && a.ctr >= b.ctr * 1.3) winner = a.i
+    }
+    return { stats, winner, at: Date.now() }
+  }
+
+  async splitBestTime(ref, post, targets) {
+    const best = await bestHours()
+    const byCat = new Map()
+    for (const g of targets) {
+      const c = g.data().category || 'عام'
+      if (!byCat.has(c)) byCat.set(c, [])
+      byCat.get(c).push(g.id)
+    }
+    const parts = []
+    for (const [cat, ids] of byCat) {
+      const h = best?.byCat?.[cat]?.hour ?? best?.all?.hour ?? null
+      const at = h == null ? Date.now() : nextCairoHour(h)
+      const soon = at <= Date.now() + 60_000
+      await postsCol.add({
+        accountId: this.id,
+        text: post.text,
+        variants: post.variants || [],
+        target: 'selected',
+        groupIds: ids,
+        regions: [],
+        mentionAll: !!post.mentionAll,
+        images: post.images || [],
+        track: !!post.track,
+        trackKey: post.trackKey || null,
+        trackRef: post.trackRef || null,
+        splitFrom: ref.id,
+        splitCat: cat,
+        status: soon ? 'queued' : 'scheduled',
+        scheduledAt: soon ? null : Timestamp.fromMillis(at),
+        sent: 0,
+        failed: 0,
+        total: 0,
+        createdAt: FieldValue.serverTimestamp(),
+      })
+      parts.push(`${cat} ${h == null ? 'هلأ' : `${h}:00`}`)
+    }
+    await ref.update({ status: 'done', total: targets.length, note: `⏰ اتقسم على أفضل وقت: ${parts.join(' · ')}`, finishedAt: FieldValue.serverTimestamp() })
+    this.log(`⏰ منشور اتقسم حسب أفضل وقت: ${parts.join(' · ')}`)
+    await this.scheduleRepeat(ref, post)
+  }
+
+  // بلد المجموعات (مرة باليوم): من أعضاء المجموعات اللي إحنا فيها
+  async regionPass() {
+    const today = dayKey()
+    if (this.data.regionDay === today || !this.participating.size) return
+    const snap = await groupsCol.where('accountId', '==', this.id).where('status', '==', 'joined').get()
+    let batch = db.batch()
+    let n = 0
+    let changed = 0
+    for (const d of snap.docs) {
+      const g = d.data()
+      const meta = g.jid && this.participating.get(g.jid)
+      if (!meta?.participants?.length) continue
+      const r = regionOf(meta.participants)
+      const patch = {}
+      if (r.region !== (g.region ?? null) || r.regionKnown !== g.regionKnown) Object.assign(patch, r)
+      const cur = g.category
+      if (settings.app.wa.autoCategory !== false && (!cur || cur === 'عام' || cur === HUNTER_CATEGORY)) {
+        const ac = autoCategory(g.name || meta.subject)
+        if (ac && ac !== cur) patch.category = ac
+      }
+      if (!Object.keys(patch).length) continue
+      batch.update(d.ref, patch)
+      changed++
+      if (++n >= 400) {
+        await batch.commit()
+        batch = db.batch()
+        n = 0
+      }
+    }
+    if (n) await batch.commit()
+    await this.set({ regionDay: today })
+    this.data = { ...this.data, regionDay: today }
+    if (changed) this.log(`🌍 تحدّث بلد/تصنيف ${changed} مجموعة`)
+  }
+
+  async scheduleRepeat(ref, post) {
     if (post.repeat === 'daily') {
       let next = (ms(post.scheduledAt) || Date.now()) + 86_400_000
       while (next < Date.now()) next += 86_400_000
@@ -991,6 +1307,11 @@ class Account {
         target: post.target,
         category: post.category || null,
         groupIds: post.groupIds || [],
+        regions: post.regions || [],
+        includeUnknown: post.includeUnknown !== false,
+        mentionAll: !!post.mentionAll,
+        bestTime: !!post.bestTime,
+        images: post.images || [],
         repeat: 'daily',
         track: !!post.track,
         trackKey: post.trackKey || null,
@@ -1187,6 +1508,17 @@ async function handleCommand(c) {
 }
 
 // ---------------- روابط الصياد ← مجموعات واتساب ----------------
+let scoreCache = { at: 0, map: new Map() }
+async function sourceScores() {
+  if (Date.now() - scoreCache.at < 3 * 3_600_000) return scoreCache.map
+  const map = new Map()
+  try {
+    ;(await db.collection('tg_sources').where('status', '==', 'done').get()).docs.forEach((d) => d.data().score?.total >= 10 && map.set(d.id, d.data().score.score))
+  } catch {}
+  scoreCache = { at: Date.now(), map }
+  return map
+}
+
 async function hunterTick() {
   const w = settings.app.wa
   if (!w.autoJoin) return
@@ -1203,10 +1535,23 @@ async function hunterTick() {
     if (!want) return
 
     const states = w.includeUnchecked ? ['active', 'unchecked'] : ['active']
-    const snap = await linksCol.where('waStatus', '==', 'none').where('status', 'in', states).orderBy('firstSeen', 'desc').limit(want).get()
+    const snap = await linksCol.where('waStatus', '==', 'none').where('status', 'in', states).orderBy('firstSeen', 'desc').limit(Math.min(150, want * 4)).get()
     if (snap.empty) return
+    // أولوية: مصدر تقييمه عالي + رابط جديد + اسم فلسطيني (جمهورنا)
+    const scores = await sourceScores()
+    const now = Date.now()
+    const prio = (d) => {
+      const l = d.data()
+      let s = scores.get(l.sourceId) ?? 40
+      const age = (now - ms(l.firstSeen)) / 86_400_000
+      s += age < 1 ? 25 : age < 3 ? 15 : age < 7 ? 5 : 0
+      if (PS_NAME_RE.test(l.groupName || '')) s += 15
+      if (isSpamName(l.groupName)) s -= 100
+      return s
+    }
+    const ordered = [...snap.docs].sort((a, b) => prio(b) - prio(a)).slice(0, want)
 
-    for (const ld of snap.docs) {
+    for (const ld of ordered) {
       const l = ld.data()
       const code = ld.id
       const targets = w.allAccounts ? slots.map((s) => s.a) : (() => {
@@ -1258,7 +1603,7 @@ async function hunterTick() {
       })
       await batch.commit()
     }
-    log(`📥 استلمت ${snap.size} رابط من الصياد`)
+    log(`📥 استلمت ${ordered.length} رابط من الصياد (حسب الأولوية)`)
   } catch (e) {
     log('⚠️ روابط الصياد:', e.message)
   }

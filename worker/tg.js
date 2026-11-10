@@ -382,6 +382,77 @@ async function deleteAccount(id) {
   event('info', `🗑️ انحذف حساب تيليجرام ${id}`)
 }
 
+// ---------------- مصادر مقترحة: روابط قنوات تيليجرام بتنذكر بالمصادر ----------------
+const suggestCol = db.collection('tg_suggest')
+const TG_RE = /(?:https?:\/\/)?(?:t|telegram)\.me\/(\+[\w-]{10,}|joinchat\/[\w-]{10,}|[A-Za-z][\w]{3,31})(?:\/\d+)?/gi
+const TG_SKIP = /^(share|addstickers|addemoji|proxy|socks|iv|s|c|setlanguage|joinchat|login|contact|boost|addlist|.*bot)$/i
+const suggestBuf = new Map() // id -> {ref, n, sources:Set}
+function noteSuggestions(msg, sid) {
+  const text = messageText(msg)
+  if (!text || !/(t|telegram)\.me\//i.test(text)) return
+  for (const m of text.matchAll(TG_RE)) {
+    const raw = m[1]
+    let id
+    let ref
+    if (raw.startsWith('+') || /^joinchat\//i.test(raw)) {
+      const h = raw.replace(/^\+|^joinchat\//i, '')
+      id = `invite_${h}`
+      ref = `https://t.me/+${h}`
+    } else {
+      if (TG_SKIP.test(raw)) continue
+      id = `public_${raw.toLowerCase()}`
+      ref = `https://t.me/${raw}`
+    }
+    const e = suggestBuf.get(id) || { ref, n: 0, sources: new Set() }
+    e.n++
+    e.sources.add(sid)
+    suggestBuf.set(id, e)
+  }
+}
+async function flushSuggestions() {
+  if (!suggestBuf.size) return
+  const entries = [...suggestBuf.entries()]
+  suggestBuf.clear()
+  // المصادر الموجودة أصلاً ما بنقترحها
+  const existing = new Set((await sourcesCol.select().get()).docs.map((d) => d.id))
+  let batch = db.batch()
+  let n = 0
+  for (const [id, e] of entries) {
+    if (existing.has(id)) continue
+    batch.set(suggestCol.doc(id), { ref: e.ref, mentions: FieldValue.increment(e.n), sources: FieldValue.arrayUnion(...[...e.sources].slice(0, 20)), lastSeen: FieldValue.serverTimestamp(), status: 'new' }, { merge: true })
+    if (++n >= 400) {
+      await batch.commit()
+      batch = db.batch()
+      n = 0
+    }
+  }
+  if (n) await batch.commit()
+}
+
+// بحث عن قنوات/جروبات عامة بكلمة
+async function searchTelegram(q) {
+  q = String(q || '').trim()
+  if (q.length < 3) throw new Error('اكتب كلمة من 3 حروف على الأقل')
+  const c = [...clients.entries()].find(([id]) => {
+    const a = accData.get(id)
+    return a && a.enabled !== false && !BAD_STATES.has(a.status) && !((Number(a.floodUntil) || 0) > Date.now())
+  })?.[1]
+  if (!c) throw new Error('ما في حساب تيليجرام جاهز للبحث')
+  const r = await c.invoke(new Api.contacts.Search({ q, limit: 50 }))
+  const existing = new Set((await sourcesCol.select().get()).docs.map((d) => d.id))
+  return (r.chats || [])
+    .filter((ch) => ch.username && (ch.className === 'Channel' || ch.className === 'Chat'))
+    .map((ch) => ({
+      id: `public_${String(ch.username).toLowerCase()}`,
+      username: ch.username,
+      title: ch.title || ch.username,
+      members: ch.participantsCount ?? null,
+      kind: ch.megagroup ? 'group' : ch.broadcast ? 'channel' : 'group',
+      added: existing.has(`public_${String(ch.username).toLowerCase()}`),
+    }))
+    .slice(0, 50)
+}
+
 // ---------------- المراقبة الحية ----------------
 // قنوات منتجات المتجر ← مسودات منتجات
 const shop = createShopImport({ clients, accData, log, event, notifier, Api })
@@ -395,6 +466,7 @@ async function onMessage(ev, id) {
   const msg = ev.message
   const info = monitored.get(rawId(msg?.chatId ?? ev.chatId))
   if (!info) return
+  noteSuggestions(msg, info.sid)
   const codes = extractCodes(msg)
   if (!codes.length) return
   let n = 0
@@ -528,10 +600,12 @@ async function processSource(sid, src, id) {
     let found = 0
     for await (const msg of client.iterMessages(ent, { limit })) {
       count++
+      noteSuggestions(msg, sid)
       for (const code of extractCodes(msg)) if (await saveLink(code, sid, title, msg.date)) found++
       if (count % 500 === 0) await ref.update({ scanned: count, linksFound: found }).catch(() => {})
     }
     await ref.update({ status: 'done', scanned: count, linksFound: found, updated: FieldValue.serverTimestamp() })
+    await flushSuggestions().catch((e) => log('⚠️ مصادر مقترحة:', e.message))
     if (src.monitor !== false) monitored.set(rawId(chatId), { sid, title })
     event('ok', `${title}: ${count} رسالة — ${found} رابط جديد`, id)
   } catch (e) {
@@ -667,6 +741,8 @@ async function handleCommand(c) {
       return recategorize()
     case 'tg_mute_all':
       return { muted: await applyMuteAll(c.on !== false) }
+    case 'tg_search':
+      return { results: await searchTelegram(c.q) }
     default:
       throw new Error('أمر غير معروف')
   }
@@ -767,6 +843,7 @@ async function main() {
   })()
 
   // فحص الروابط الجديدة تلقائياً كل 5 دقائق
+  setInterval(() => flushSuggestions().catch(() => {}), 10 * 60_000)
   setInterval(async () => {
     try {
       if (T().autoCheck !== false && !checkState.running) {

@@ -4,13 +4,19 @@
 //  (نفس الملف منسوخ بـ web/src/socialDesign.js)
 // ============================================================
 
-export const SOCIAL_DEFAULTS = { enabled: true, at: '08:00', count: 3, cooldownDays: 30 }
+export const SOCIAL_DEFAULTS = { enabled: true, at: '08:00', count: 3, cooldownDays: 30, waOn: true, waCategory: 'بيع وشراء', waRegions: ['ps'], waTimes: ['10:00', '15:00', '20:00'], waAccounts: [], waMention: false }
 export const mergeSocial = (s = {}) => ({
   ...SOCIAL_DEFAULTS,
   ...s,
   count: Math.min(5, Math.max(1, Number(s.count) || SOCIAL_DEFAULTS.count)),
   cooldownDays: Math.min(120, Math.max(3, Number(s.cooldownDays) || SOCIAL_DEFAULTS.cooldownDays)),
   at: /^\d{2}:\d{2}$/.test(s.at || '') ? s.at : SOCIAL_DEFAULTS.at,
+  waOn: s.waOn !== false,
+  waCategory: String(s.waCategory ?? SOCIAL_DEFAULTS.waCategory).trim(),
+  waRegions: Array.isArray(s.waRegions) ? s.waRegions : SOCIAL_DEFAULTS.waRegions,
+  waTimes: (Array.isArray(s.waTimes) && s.waTimes.length ? s.waTimes : SOCIAL_DEFAULTS.waTimes).filter((t) => /^\d{2}:\d{2}$/.test(t)).slice(0, 5),
+  waAccounts: Array.isArray(s.waAccounts) ? s.waAccounts : [],
+  waMention: !!s.waMention,
 })
 
 // ألوان المتجر
