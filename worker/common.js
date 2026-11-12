@@ -118,7 +118,7 @@ export const APP_DEFAULTS = {
   welcomeAccountId: '',
   notify: { enabled: false, botToken: '', chatId: '', registrations: true, workerDown: true, accountIssues: true, funnel: true, daily: true, dailyAt: '23:00', replies: true },
   system: { repo: '', branch: 'main' },
-  wa: { autoJoin: false, includeUnchecked: false, dailyJoinLimit: 10, allAccounts: true, postUnlimited: false, warmupDays: 14, muteGroups: false, autoClean: false, hourLimit: 40, groupGapHours: 0, autoStop: true, stopAfterFails: 6, pauseHours: 3, minMembers: 20, spamFilter: true, smartSpread: true, typingSeconds: 5, mentionAll: false, replyAlerts: true, autoCategory: true, riskThrottle: true },
+  wa: { autoJoin: false, includeUnchecked: false, dailyJoinLimit: 10, allAccounts: true, postUnlimited: false, warmupDays: 14, muteGroups: false, autoClean: false, hourLimit: 40, groupGapHours: 0, autoStop: true, stopAfterFails: 6, pauseHours: 3, minMembers: 20, spamFilter: true, smartSpread: true, typingSeconds: 5, mentionAll: false, replyAlerts: true, autoCategory: true, riskThrottle: true, harvestLinks: true },
   tg: {
     apiId: '',
     apiHash: '',

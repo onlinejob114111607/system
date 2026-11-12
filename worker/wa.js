@@ -424,6 +424,60 @@ class Account {
   }
 
   // ---------- تنبيه الردود على منشوراتنا ----------
+  // 🎣 صياد من مجموعات الواتساب: أي رابط مجموعة بينبعت بمجموعة إحنا فيها ← طابور الصياد
+  async harvestLinks(u) {
+    if (settings.app.wa.harvestLinks === false || !['notify', 'append'].includes(u.type)) return
+    for (const m of u.messages || []) {
+      const jid = m.key?.remoteJid
+      if (!jid?.endsWith('@g.us') || m.key.fromMe || !m.message) continue
+      const x = unwrapMsg(m.message)
+      const text = [x.conversation, x.extendedTextMessage?.text, x.extendedTextMessage?.matchedText, x.imageMessage?.caption, x.videoMessage?.caption, x.documentMessage?.caption].filter(Boolean).join('\n')
+      const codes = new Map()
+      for (const mm of text.matchAll(WA_LINK_RE)) codes.set(mm[1], null)
+      const inv = x.groupInviteMessage
+      if (inv?.inviteCode) codes.set(inv.inviteCode, inv.groupName || null)
+      if (!codes.size) continue
+      const sid = 'wa_' + jid.split('@')[0]
+      if ((await harvestBlocked()).has(sid)) continue
+      const title = this.participating.get(jid)?.subject || null
+      const ts = Number(m.messageTimestamp?.toNumber?.() ?? m.messageTimestamp) || 0
+      let n = 0
+      for (const [code, gname] of codes) {
+        if (harvestSeen.has(code)) continue
+        if (harvestSeen.size > 50_000) harvestSeen.clear()
+        harvestSeen.add(code)
+        try {
+          await linksCol.doc(code).create({
+            url: `https://chat.whatsapp.com/${code}`,
+            sourceId: sid,
+            sourceTitle: title,
+            msgDate: ts ? Timestamp.fromMillis(ts * 1000) : null,
+            firstSeen: FieldValue.serverTimestamp(),
+            status: 'unchecked',
+            groupName: gname,
+            category: null,
+            checkedAt: null,
+            waStatus: 'none',
+            from: 'wa',
+            foundBy: this.id,
+          })
+          n++
+        } catch (e) {
+          if (e.code !== 6 && !/exist/i.test(e.message || '')) {
+            harvestSeen.delete(code)
+            throw e
+          }
+        }
+      }
+      if (!n) continue
+      const b = harvestBuf.get(sid) || { title, n: 0, accounts: new Set() }
+      b.n += n
+      b.title = title || b.title
+      b.accounts.add(this.id)
+      harvestBuf.set(sid, b)
+    }
+  }
+
   async checkReplies(u) {
     if (settings.app.wa.replyAlerts === false || u.type !== 'notify') return
     const ASK_RE = /(كم السعر|بكم|بقديش|قديش|كم سعر|السعر|سعره|سعرها|الاسعار|الأسعار|بدي اطلب|بدي أطلب|بدي اسجل|بدي أسجل|كيف (بسجل|اسجل|أسجل|التسجيل|بطلب|اطلب|أطلب)|التفاصيل|تفاصيل|ممكن رقم|الرابط|بالخاص|خاص|price|how much)/i
@@ -553,6 +607,7 @@ class Account {
         if (j?.endsWith('@g.us') && m.key.id && m.messageTimestamp) this.lastMsg.set(j, { key: { ...m.key }, messageTimestamp: m.messageTimestamp })
       }
       this.checkReplies(u).catch(() => {})
+      this.harvestLinks(u).catch((e) => this.log('⚠️ لقط الروابط:', e.message))
       funnel.onUpsert(this, u).catch((e) => this.log('⚠️ متابعة:', e.message))
       shop.onUpsert(this, u).catch((e) => this.log('⚠️ المتجر:', e.message))
     })
@@ -1507,6 +1562,49 @@ async function handleCommand(c) {
   throw new Error('أمر غير معروف')
 }
 
+// ---------------- 🎣 صياد الروابط من مجموعات الواتساب ----------------
+const WA_LINK_RE = /chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{15,32})/gi
+const harvestSeen = new Set()
+const harvestBuf = new Map()
+const waSourcesCol = db.collection('wa_sources')
+function unwrapMsg(m) {
+  let x = m || {}
+  for (let i = 0; i < 6; i++) {
+    const inner = x.ephemeralMessage?.message || x.viewOnceMessage?.message || x.viewOnceMessageV2?.message || x.viewOnceMessageV2Extension?.message || x.documentWithCaptionMessage?.message || x.editedMessage?.message
+    if (!inner) break
+    x = inner
+  }
+  return x
+}
+let blockedCache = { at: 0, set: new Set() }
+async function harvestBlocked() {
+  if (Date.now() - blockedCache.at < 10 * 60_000) return blockedCache.set
+  const set = new Set()
+  try {
+    ;(await waSourcesCol.where('blocked', '==', true).get()).docs.forEach((d) => set.add(d.id))
+  } catch {}
+  blockedCache = { at: Date.now(), set }
+  return set
+}
+// تجميع العدادات وكتابتها كل 10 دقايق (توفير حصة Firebase)
+async function flushHarvest() {
+  if (!harvestBuf.size) return
+  const items = [...harvestBuf.entries()]
+  harvestBuf.clear()
+  let total = 0
+  const batch = db.batch()
+  for (const [sid, b] of items) {
+    total += b.n
+    batch.set(
+      waSourcesCol.doc(sid),
+      { jid: sid.slice(3) + '@g.us', title: b.title || null, links: FieldValue.increment(b.n), accounts: FieldValue.arrayUnion(...b.accounts), lastSeen: FieldValue.serverTimestamp() },
+      { merge: true },
+    )
+  }
+  await batch.commit()
+  log(`🎣 لقطت ${total} رابط مجموعة جديد من ${items.length} مجموعة واتساب`)
+}
+
 // ---------------- روابط الصياد ← مجموعات واتساب ----------------
 let scoreCache = { at: 0, map: new Map() }
 async function sourceScores() {
@@ -1514,6 +1612,9 @@ async function sourceScores() {
   const map = new Map()
   try {
     ;(await db.collection('tg_sources').where('status', '==', 'done').get()).docs.forEach((d) => d.data().score?.total >= 10 && map.set(d.id, d.data().score.score))
+  } catch {}
+  try {
+    ;(await waSourcesCol.where('links', '>=', 10).get()).docs.forEach((d) => d.data().score?.total >= 10 && map.set(d.id, d.data().score.score))
   } catch {}
   scoreCache = { at: Date.now(), map }
   return map
@@ -1741,6 +1842,7 @@ async function main() {
   }, 15_000)
 
   setTimeout(hunterTick, 20_000)
+  setInterval(() => flushHarvest().catch((e) => log('⚠️ حفظ مصادر الواتساب:', e.message)), 10 * 60_000)
   setInterval(hunterTick, 90_000)
   // إعادة تشغيل الطوابير (بعد انتهاء التهدئة أو ساعات الهدوء أو بداية يوم جديد)
   setInterval(() => accounts.forEach((a) => a.pumpAll()), 5 * 60_000)
