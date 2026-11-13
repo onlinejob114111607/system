@@ -3,12 +3,15 @@
 //  كل يوم (الساعة 8 الصبح افتراضياً) بيختار 3 منتجات، بياخد صورهم الأصلية،
 //  بيكتب الوصف (عربي وتحته إنجليزي، بدون سعر — السعر عالموقع أو عالخاص)،
 //  وبيبعتهم على تيليجرام. اللوحة بتعرضهم بصفحة «منشورات اليوم».
+//  ولو «النشر المباشر» مفعّل: بينشرهم لحاله على صفحة فيسبوك (منشور + قصة)
+//  وعلى إنستغرام (منشور + قصة)، كل منتج بوقته — عن طريق Meta (meta.js)
 //  الإعدادات: store/social · المنشورات: store_social/{يوم}
 // ============================================================
 import { db, FieldValue, Timestamp, dayKey } from './common.js'
 import { translateTexts } from './translate.js'
 import { storeBase } from './catalog.js'
 import { captions, mergeSocial, cleanText } from './socialDesign.js'
+import { createMeta } from './meta.js'
 
 const TZ = 'Africa/Cairo'
 const cfgRef = db.doc('store/social')
@@ -281,17 +284,120 @@ export function createSocial({ settings, log, event }) {
     return { sent: doc.items.length }
   }
 
+  // ---------- النشر المباشر على فيسبوك وإنستغرام (Meta) ----------
+  const TARGETS = [
+    ['fbPost', 'metaFbPost', 'منشور فيسبوك'],
+    ['fbStory', 'metaFbStory', 'قصة فيسبوك'],
+    ['igPost', 'metaIgPost', 'منشور إنستغرام'],
+    ['igStory', 'metaIgStory', 'قصة إنستغرام'],
+  ]
+  const MAX_TRIES = 3
+  const RETRY_MS = 15 * 60_000
+  let metaBusy = false
+  let metaWarned = 0
+
+  async function metaClient() {
+    const priv = await loadPriv()
+    return createMeta({ token: String(priv.metaToken || '').trim(), pageId: cfg.metaPageId, igId: cfg.metaIgId, version: cfg.metaVersion })
+  }
+  const metaSlot = (day, i) => cairoAt(day, cfg.metaTimes[i % cfg.metaTimes.length] || '10:00')
+  // الهدف لسا بدو نشر؟ (مفعّل، ما انتشر، وما خلّص محاولاته — إلا لو «انشر هلأ»)
+  const pending = (it, force) =>
+    TARGETS.filter(([k, flag]) => {
+      if (!cfg[flag]) return false
+      const m = it.meta?.[k]
+      if (m?.id) return false
+      if (force || !m) return true
+      return (m.tries || 0) < MAX_TRIES && Date.now() - (m.at || 0) > RETRY_MS
+    })
+
+  async function publishItem(day, index, { force = false } = {}) {
+    const ref = dayCol.doc(day)
+    let it = (await ref.get()).data()?.items?.[index]
+    if (!it) throw new Error('المنشور مش موجود')
+    const todo = pending(it, force)
+    if (!todo.length) return { done: 0 }
+    const meta = await metaClient()
+    const photos = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean)
+    const results = {}
+    for (const [k, , label] of todo) {
+      const prev = it.meta?.[k] || {}
+      try {
+        let id
+        if (k === 'fbPost') id = await meta.fbPost(photos, it.fb)
+        else if (k === 'fbStory') id = await meta.fbStory(photos[0])
+        else if (k === 'igPost') id = await meta.igPost(photos, it.ig)
+        else id = await meta.igStory(photos.find((u) => !/\.(png|webp|gif)(\?|$)/i.test(u)) || photos[0])
+        results[k] = { id: String(id), at: Date.now() }
+        log(`📣 ${label}: ${it.name} ✓`)
+      } catch (e) {
+        results[k] = { error: e.message.slice(0, 300), at: Date.now(), tries: (prev.tries || 0) + 1 }
+        log(`⚠️ ${label} (${it.name}):`, e.message)
+      }
+    }
+    // نقرأ من جديد قبل الكتابة (عشان ما نمسح تعديلات اللوحة بالنص)
+    const doc = (await ref.get()).data()
+    const items = [...(doc?.items || [])]
+    if (!items[index] || items[index].pid !== it.pid) return { done: 0 }
+    const merged = { ...(items[index].meta || {}), ...results }
+    const ok = Object.values(results).filter((r) => r.id).length
+    items[index] = { ...items[index], meta: merged, ...(merged.fbPost?.id || merged.igPost?.id ? { posted: true, postedAt: items[index].postedAt || Date.now() } : {}) }
+    await ref.update({ items })
+    const bad = Object.entries(results).filter(([, r]) => r.error)
+    if (bad.length) event?.('error', `⚠️ النشر على Meta (${it.name}): ${bad.map(([k, r]) => `${TARGETS.find((t) => t[0] === k)[2]}: ${r.error}`).join(' · ')}`)
+    else if (ok) event?.('ok', `📣 انتشر «${it.name}» على فيسبوك وإنستغرام`)
+    return { done: ok, failed: bad.length }
+  }
+
+  // كل دقيقة: أي منتج إجى وقته وفي إشي لسا ما انتشر ← بننشره
+  async function metaTick() {
+    if (!cfg.metaOn || metaBusy) return
+    const day = dayKey()
+    const doc = (await dayCol.doc(day).get()).data()
+    if (!doc?.items?.length) return
+    metaBusy = true
+    try {
+      for (let i = 0; i < doc.items.length; i++) {
+        if (Date.now() < metaSlot(day, i) || !pending(doc.items[i], false).length) continue
+        await publishItem(day, i).catch((e) => {
+          // إعدادات ناقصة (توكن/صفحة) ← تنبيه مرة بالساعة بس
+          if (Date.now() - metaWarned > 3600_000) {
+            metaWarned = Date.now()
+            log('⚠️ النشر على Meta:', e.message)
+            event?.('error', `⚠️ النشر على فيسبوك وإنستغرام واقف: ${e.message}`)
+          }
+        })
+      }
+    } finally {
+      metaBusy = false
+    }
+  }
+
+  async function metaTest() {
+    await loadCfg()
+    const info = await (await metaClient()).info()
+    await cfgRef.set({ metaIgId: info.igId || '', metaCheck: { ...info, at: Date.now() } }, { merge: true })
+    return info
+  }
+
   // الجدولة: كل دقيقة بنشيّك
   async function tick() {
     try {
       await loadCfg()
-      if (!cfg.enabled || hmNow() < cfg.at) return
-      const day = dayKey()
-      if ((await dayCol.doc(day).get()).exists) return
-      await generate(day)
-      event?.('ok', '📣 منشورات اليوم لفيسبوك وإنستغرام جاهزة')
+      if (cfg.enabled && hmNow() >= cfg.at) {
+        const day = dayKey()
+        if (!(await dayCol.doc(day).get()).exists) {
+          await generate(day)
+          event?.('ok', cfg.metaOn ? '📣 منشورات اليوم جاهزة — بتنزل لحالها على فيسبوك وإنستغرام بأوقاتها' : '📣 منشورات اليوم لفيسبوك وإنستغرام جاهزة')
+        }
+      }
     } catch (e) {
       if (!/التجهيز شغال/.test(e.message)) log('⚠️ منشورات اليوم:', e.message)
+    }
+    try {
+      await metaTick()
+    } catch (e) {
+      log('⚠️ النشر على Meta:', e.message)
     }
   }
 
@@ -304,6 +410,16 @@ export function createSocial({ settings, log, event }) {
     generate,
     async command(c) {
       const day = c.day || dayKey()
+      if (c.type === 'social_meta_test') return metaTest()
+      if (c.type === 'social_meta_publish') {
+        if (metaBusy) throw new Error('النشر شغال — استنى شوي')
+        await loadCfg()
+        metaBusy = true
+        publishItem(day, Number(c.index) || 0, { force: true })
+          .catch((e) => (log('⚠️ النشر على Meta:', e.message), event?.('error', `⚠️ النشر على Meta: ${e.message}`)))
+          .finally(() => (metaBusy = false))
+        return { started: true }
+      }
       const job = c.type === 'social_generate' ? () => generate(day, { send: c.send !== false }) : c.type === 'social_replace' ? () => replace(day, Number(c.index) || 0) : c.type === 'social_send' ? () => resend(day) : null
       if (!job) throw new Error('أمر غير معروف')
       if (busy) throw new Error('التجهيز شغال — استنى شوي')
