@@ -267,6 +267,7 @@ export const FUNNEL_DEFAULTS = {
   disclosure: DISCLOSURE_TEXT,
   nudgeAfter: 120, // دقائق بدون رد قبل رسالة "في حال لم يتم الرد" (0 = مطفية)
   nudgeText: NUDGE_TEXT,
+  manualOnly: false, // يدوي بس: الدفعة ما بتبدأ لحالها، بس من زر «ابدأ دفعة اليوم هلأ» بأيام اللقاء
   manualStops: false, // ردك من الجوال بيوقف البوت؟ (لا = بيعتبره جواب وبيكمل)
   joinAck: JOIN_ACK,
   noShowOn: true,
@@ -332,6 +333,7 @@ export function mergeFunnel(data) {
   for (const k of ['startTime', 'lateUntil', 'closeTime', 'meetingTime', 'eveStart', 'eveEnd', 'earlyUntil']) out[k] = hm(out[k], FUNNEL_DEFAULTS[k])
   for (const k of ['regLink', 'refNo', 'senderName', 'teamLeader', 'replayLink', 'nudgeText', 'costText', 'disclosure', 'joinAck', 'noShowText']) out[k] = String(out[k] ?? '')
   if (!out.disclosure.trim()) out.disclosure = DISCLOSURE_TEXT
+  out.manualOnly = !!out.manualOnly
   out.manualStops = !!out.manualStops
   out.discloseOn = !!out.discloseOn
   out.noShowOn = out.noShowOn !== false
