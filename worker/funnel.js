@@ -1077,7 +1077,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   // تسجيل جديد (يوم اللقاء لحد ساعة معينة، أو ليلة قبل) بيدخل الدفعة لو في مكان
   async function onNewRegistration(doc) {
     try {
-      if (!cfg.enabled || (cfg.discloseOn && !cfg.costText.trim())) return
+      if (!cfg.enabled || cfg.manualOnly || (cfg.discloseOn && !cfg.costText.trim())) return
       const open = openBatchDay()
       if (!open || !open.late) return
       const day = open.day
@@ -1223,7 +1223,8 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
       if (listenKey !== `${t}|${tomorrow()}`) subscribeDays()
       if (cfg.enabled) {
         const open = openBatchDay()
-        if (open && !runDone.has(open.day)) await runBatch({ day: open.day })
+        // وضع «يدوي بس»: الدفعة ما بتبدأ لحالها — بس من زر «ابدأ دفعة اليوم هلأ» باللوحة
+        if (open && !runDone.has(open.day) && !cfg.manualOnly) await runBatch({ day: open.day })
         await scheduleTimed()
         await callLists()
         await goalChecks()
@@ -1266,7 +1267,11 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
 
   // ---------- أوامر اللوحة ----------
   async function command(c) {
-    if (c.type === 'funnel_run_now') return runBatch({ day: today(), force: true })
+    if (c.type === 'funnel_run_now') {
+      // بوضع «يدوي بس» الدفعة بتنبعت بس بأيام اللقاء
+      if (cfg.manualOnly && !isMeetingDay(today())) return { added: 0, note: 'اليوم مش يوم لقاء — بوضع «يدوي بس» الدفعة بتنبعت بس بأيام اللقاء' }
+      return runBatch({ day: today(), force: true })
+    }
     if (c.type === 'funnel_answer') return answer(c)
     if (c.type === 'funnel_send') {
       const phone = String(c.phone || '').replace(/\D/g, '')
