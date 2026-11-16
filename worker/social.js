@@ -291,6 +291,34 @@ export function createSocial({ settings, log, event }) {
     ['igPost', 'metaIgPost', 'منشور إنستغرام'],
     ['igStory', 'metaIgStory', 'قصة إنستغرام'],
   ]
+  // عن طريق Make.com: هدف واحد (الـ Webhook) وMake بينشر على فيسبوك وإنستغرام
+  const HOOK = ['hook', null, 'Make.com']
+  const viaMake = () => cfg.metaVia === 'make'
+  const isJpg = (u) => !/\.(png|webp|gif)(\?|#|$)/i.test(String(u || ''))
+  async function sendHook(url, it, day, index, test = false) {
+    const photos = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean).slice(0, 10)
+    const igPhotos = photos.filter(isJpg).slice(0, 10)
+    const body = {
+      test,
+      day,
+      index: index + 1,
+      name: it.name,
+      fb_text: it.fb,
+      ig_text: it.ig,
+      link: it.link,
+      photo: photos[0] || '',
+      photos,
+      photo_count: photos.length,
+      ig_photo: igPhotos[0] || '',
+      ig_photos: igPhotos,
+      ig_photo_count: igPhotos.length,
+      story_photo: igPhotos[0] || photos[0] || '',
+    }
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) })
+    const t = await r.text().catch(() => '')
+    if (!r.ok) throw new Error(`Make رد بـ ${r.status}${t ? `: ${t.slice(0, 120)}` : ''}`)
+    return t.slice(0, 60) || 'ok'
+  }
   const MAX_TRIES = 3
   const RETRY_MS = 15 * 60_000
   let metaBusy = false
@@ -303,8 +331,8 @@ export function createSocial({ settings, log, event }) {
   const metaSlot = (day, i) => cairoAt(day, cfg.metaTimes[i % cfg.metaTimes.length] || '10:00')
   // الهدف لسا بدو نشر؟ (مفعّل، ما انتشر، وما خلّص محاولاته — إلا لو «انشر هلأ»)
   const pending = (it, force) =>
-    TARGETS.filter(([k, flag]) => {
-      if (!cfg[flag]) return false
+    (viaMake() ? [HOOK] : TARGETS).filter(([k, flag]) => {
+      if (flag && !cfg[flag]) return false
       const m = it.meta?.[k]
       if (m?.id) return false
       if (force || !m) return true
@@ -317,14 +345,18 @@ export function createSocial({ settings, log, event }) {
     if (!it) throw new Error('المنشور مش موجود')
     const todo = pending(it, force)
     if (!todo.length) return { done: 0 }
-    const meta = await metaClient()
+    const priv = viaMake() ? await loadPriv() : null
+    const hookUrl = String(priv?.makeHookUrl || '').trim()
+    if (viaMake() && !hookUrl) throw new Error('ما في رابط Webhook من Make — حطه باللوحة ← منشورات اليوم')
+    const meta = viaMake() ? null : await metaClient()
     const photos = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean)
     const results = {}
     for (const [k, , label] of todo) {
       const prev = it.meta?.[k] || {}
       try {
         let id
-        if (k === 'fbPost') id = await meta.fbPost(photos, it.fb)
+        if (k === 'hook') id = await sendHook(hookUrl, it, day, index)
+        else if (k === 'fbPost') id = await meta.fbPost(photos, it.fb)
         else if (k === 'fbStory') id = await meta.fbStory(photos[0])
         else if (k === 'igPost') id = await meta.igPost(photos, it.ig)
         else id = await meta.igStory(photos.find((u) => !/\.(png|webp|gif)(\?|$)/i.test(u)) || photos[0])
@@ -341,10 +373,10 @@ export function createSocial({ settings, log, event }) {
     if (!items[index] || items[index].pid !== it.pid) return { done: 0 }
     const merged = { ...(items[index].meta || {}), ...results }
     const ok = Object.values(results).filter((r) => r.id).length
-    items[index] = { ...items[index], meta: merged, ...(merged.fbPost?.id || merged.igPost?.id ? { posted: true, postedAt: items[index].postedAt || Date.now() } : {}) }
+    items[index] = { ...items[index], meta: merged, ...(merged.fbPost?.id || merged.igPost?.id || merged.hook?.id ? { posted: true, postedAt: items[index].postedAt || Date.now() } : {}) }
     await ref.update({ items })
     const bad = Object.entries(results).filter(([, r]) => r.error)
-    if (bad.length) event?.('error', `⚠️ النشر على Meta (${it.name}): ${bad.map(([k, r]) => `${TARGETS.find((t) => t[0] === k)[2]}: ${r.error}`).join(' · ')}`)
+    if (bad.length) event?.('error', `⚠️ النشر على فيسبوك وإنستغرام (${it.name}): ${bad.map(([k, r]) => `${[...TARGETS, HOOK].find((t) => t[0] === k)[2]}: ${r.error}`).join(' · ')}`)
     else if (ok) event?.('ok', `📣 انتشر «${it.name}» على فيسبوك وإنستغرام`)
     return { done: ok, failed: bad.length }
   }
@@ -411,6 +443,14 @@ export function createSocial({ settings, log, event }) {
     async command(c) {
       const day = c.day || dayKey()
       if (c.type === 'social_meta_test') return metaTest()
+      if (c.type === 'social_hook_test') {
+        // تجربة رابط Make بمنتج من منشورات اليوم (test: true — Make بيقدر يتجاهلها أو ينشرها)
+        const doc = (await dayCol.doc(day).get()).data()
+        const it = doc?.items?.[0] || { name: 'تجربة', fb: 'منشور تجريبي', ig: 'منشور تجريبي', link: '', photos: [] }
+        const url = String((await loadPriv()).makeHookUrl || '').trim()
+        if (!url) throw new Error('احفظ رابط الـ Webhook أول')
+        return { reply: await sendHook(url, it, day, 0, true) }
+      }
       if (c.type === 'social_meta_publish') {
         if (metaBusy) throw new Error('النشر شغال — استنى شوي')
         await loadCfg()
