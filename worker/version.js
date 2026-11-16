@@ -1,2 +1,2 @@
 // رقم إصدار العمّال — بيطلع بصفحة «صحة النظام» باللوحة
-export const VERSION = '2026.11.16c'
+export const VERSION = '2026.11.16d'

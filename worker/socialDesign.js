@@ -4,7 +4,7 @@
 //  (نفس الملف منسوخ بـ web/src/socialDesign.js)
 // ============================================================
 
-export const SOCIAL_DEFAULTS = { enabled: true, at: '08:00', count: 3, cooldownDays: 30, waOn: true, waCategory: 'بيع وشراء', waRegions: ['ps'], waTimes: ['10:00', '15:00', '20:00'], waAccounts: [], waMention: false, metaOn: false, metaFbPost: true, metaFbStory: true, metaIgPost: true, metaIgStory: true, metaTimes: ['10:00', '15:00', '20:00'], metaPageId: '', metaIgId: '', metaVersion: '' }
+export const SOCIAL_DEFAULTS = { enabled: true, at: '08:00', count: 3, cooldownDays: 30, waOn: true, waCategory: 'بيع وشراء', waRegions: ['ps'], waTimes: ['10:00', '15:00', '20:00'], waAccounts: [], waMention: false, metaOn: false, metaVia: 'graph', metaFbPost: true, metaFbStory: true, metaIgPost: true, metaIgStory: true, metaTimes: ['10:00', '15:00', '20:00'], metaPageId: '', metaIgId: '', metaVersion: '' }
 export const mergeSocial = (s = {}) => ({
   ...SOCIAL_DEFAULTS,
   ...s,
@@ -19,6 +19,7 @@ export const mergeSocial = (s = {}) => ({
   waMention: !!s.waMention,
   // النشر المباشر على فيسبوك وإنستغرام (Meta)
   metaOn: !!s.metaOn,
+  metaVia: s.metaVia === 'make' ? 'make' : 'graph', // graph = مباشر عن طريق Meta · make = عن طريق Make.com
   metaFbPost: s.metaFbPost !== false,
   metaFbStory: s.metaFbStory !== false,
   metaIgPost: s.metaIgPost !== false,
