@@ -126,6 +126,16 @@ export function cairoInstant(day, hm) {
   return new Date(guess - (asCairo - guess))
 }
 
+// صباح الخير / مساء الخير حسب الساعة عند الشخص (من رمز بلد رقمه)
+export function greetingIn(tz, d = new Date()) {
+  const h = Number(new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', hourCycle: 'h23' }).format(d))
+  return h >= 4 && h < 12 ? 'صباح الخير' : 'مساء الخير'
+}
+// الساعة مع ص/م (مثلاً 8:00 م) — للي بلدهم بعيد والساعة ممكن تكون الصبح
+export function timeAmPm(date, tz) {
+  const t = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true }).format(date)
+  return t.replace(/\s*AM$/i, ' ص').replace(/\s*PM$/i, ' م')
+}
 export function timeIn(date, tz) {
   return new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true })
     .format(date)
@@ -152,7 +162,9 @@ export function varsFor(conv, cfg) {
     التكلفة: cfg.costText,
     بلدك: zone.label,
     ساعة_محلي: timeIn(at, zone.tz),
-    تحية: Number(cairoHM().slice(0, 2)) < 12 ? 'صباح الخير' : 'مساء الخير',
+    ساعة_محلي_كاملة: timeAmPm(at, zone.tz),
+    تحية: greetingIn(zone.tz),
+    مدينته: String(conv.city || '').trim() || zone.label,
   }
   for (const [label, tz] of Object.entries(TIME_ZONES)) vars[`ساعة_${label}`] = timeIn(at, tz)
   return vars
@@ -289,12 +301,25 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   let costWarned = 0
 
   // ---------- الحساب ----------
+  const usable = (a) => (a && a.connected && a.sock ? a : null)
+  let onBackup = false
   function account() {
     const id = cfg.accountId || settings.app.welcomeAccountId
-    const a = id ? accounts.get(id) : [...accounts.values()].find((x) => x.connected)
-    return a && a.connected && a.sock ? a : null
+    const main = usable(id ? accounts.get(id) : [...accounts.values()].find((x) => x.connected))
+    // الرقم الاحتياطي: لو رقم المتابعة مقطوع بنكمّل منه بدل ما توقف المتابعة
+    const backup = !main && cfg.backupAccountId && cfg.backupAccountId !== id ? usable(accounts.get(cfg.backupAccountId)) : null
+    const using = !!backup
+    if (using !== onBackup) {
+      onBackup = using
+      const msg = using ? `🔁 رقم المتابعة مقطوع — كمّلنا من الرقم الاحتياطي (${backup.label || backup.id})` : '✅ رجع رقم المتابعة الأساسي'
+      event(using ? 'error' : 'ok', msg)
+      notifier.notify('funnel', msg, { key: 'funnel_backup', cooldownMs: 10 * 60_000 })
+    }
+    return main || backup
   }
   const accountId = () => cfg.accountId || settings.app.welcomeAccountId || [...accounts.values()].find((x) => x.connected)?.id || null
+  // الردود بتنقرا من الرقم الأساسي والاحتياطي
+  const isFunnelAcc = (acc) => acc.id === accountId() || (!!cfg.backupAccountId && acc.id === cfg.backupAccountId)
 
   // ---------- الوقت ----------
   const today = () => dayKey()
@@ -624,9 +649,10 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     const phone = conv.phone
     const key = conv.remDue
     const done = async (extra = {}) => updateConv(phone, { remDue: null, rems: { ...(conv.rems || {}), [key]: extra.skip ? 'skip' : Date.now() }, ...extra.patch })
-    if (key === 'nudge' ? !canSend(conv) || dayOver(conv) : conv.day !== today()) return done({ skip: true })
+    const isNudge = key === 'nudge' || key === 'wnudge'
+    if (isNudge ? !canSend(conv) || dayOver(conv) : conv.day !== today()) return done({ skip: true })
     const r = cfg.reminders.find((x) => x.key === key)
-    const items = key === 'nudge' ? [cfg.nudgeText] : r ? [...r.messages, ...(r.voice ? [{ voice: r.voice }] : [])] : []
+    const items = key === 'wnudge' ? [cfg.welcomeNudgeText] : key === 'nudge' ? [cfg.nudgeText] : r ? [...r.messages, ...(r.voice ? [{ voice: r.voice }] : [])] : []
     const tooLate = Date.now() >= meetingAt(conv.day)
     if (!items.length || tooLate) return done({ skip: true })
     let jid
@@ -645,7 +671,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
       return done({ skip: true, patch: { history: history.slice(-HISTORY_MAX), attention: true, attentionWhy: `فشل الإرسال: ${e.message}` } })
     }
     await done({ patch: { history: history.slice(-HISTORY_MAX), lastOutAt: Date.now(), jid } })
-    acc.log(`⏰ متابعة: "${key === 'nudge' ? 'في حال لم يتم الرد' : r?.label}" لـ ${conv.name || phone}`)
+    acc.log(`⏰ متابعة: "${key === 'wnudge' ? 'ما رد على الترحيب' : key === 'nudge' ? 'في حال لم يتم الرد' : r?.label}" لـ ${conv.name || phone}`)
   }
 
   const bookTypeNow = (day) => (Date.now() < cairoInstant(day, cfg.earlyUntil).getTime() ? 'early' : 'late')
@@ -707,7 +733,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   }
 
   async function onUpsert(acc, { messages }) {
-    if (!cfg.enabled || acc.id !== accountId()) return
+    if (!cfg.enabled || !isFunnelAcc(acc)) return
     for (const msg of messages || []) {
       try {
         const key = msg.key || {}
@@ -756,7 +782,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
 
   // قراءة الرسائل (الصحين الزرق) ← "شاف"
   async function onUpdate(acc, updates) {
-    if (!cfg.enabled || acc.id !== accountId()) return
+    if (!cfg.enabled || !isFunnelAcc(acc)) return
     for (const u of updates || []) {
       try {
         const key = u.key || {}
@@ -984,6 +1010,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
           regId: d.id,
           name: r.name || '',
           country: r.country || '',
+          city: String(r.city || '').slice(0, 60),
           src: String(r.utm || r.source || '').slice(0, 40),
           day,
           status: 'queued',
@@ -1196,7 +1223,23 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
         await updateConv(c.phone, { remDue: last.key, rems: rmap })
         enqueue(c.phone, true)
       } else if (
+        // ما رد على رسالة الترحيب ← تذكير قصير مرة وحدة
         c.status === 'active' &&
+        cfg.welcomeNudgeAfter > 0 &&
+        cfg.welcomeNudgeText.trim() &&
+        !c.wNudged &&
+        cfg.steps[stepIndexOf(cfg, c)]?.key === 'welcome' &&
+        c.lastOutAt &&
+        now - c.lastOutAt >= cfg.welcomeNudgeAfter * 60_000 &&
+        (c.lastInAt || 0) < c.lastOutAt &&
+        canSend(c) &&
+        now < meetingAt(c.day)
+      ) {
+        await updateConv(c.phone, { remDue: 'wnudge', wNudged: true })
+        enqueue(c.phone, true)
+      } else if (
+        c.status === 'active' &&
+        !(cfg.welcomeNudgeAfter > 0 && cfg.steps[stepIndexOf(cfg, c)]?.key === 'welcome') &&
         cfg.nudgeAfter > 0 &&
         cfg.nudgeText.trim() &&
         !c.nudged &&

@@ -17,7 +17,7 @@ export const FUNNEL_STEPS = [
     rejectStops: true,
     resume: '',
     voice: 'welcome',
-    messages: ['مرحباً {name}\nكيف حالك؟\nمعك {اسمي}\nحضرتك تركت تفاصيلك عبر السوشال ميديا بخصوص عمل إضافي تسويق الكتروني..\nصحيح؟'],
+    messages: ['{تحية} {name} 🌷\nكيف حالك؟\nمعك {اسمي}\nحضرتك تركت تفاصيلك عبر السوشال ميديا بخصوص عمل إضافي تسويق الكتروني..\nصحيح؟'],
   },
   {
     key: 'focus',
@@ -283,6 +283,9 @@ export const FUNNEL_DEFAULTS = {
   quietEnd: '09:00',
   dailyCap: 60, // أقصى عدد ترحيب جديد باليوم (afterReg)
   stepsMig: ['focus'], // خطوات جديدة انضافت للنصوص المحفوظة (ما بتنضاف مرتين)
+  backupAccountId: '', // رقم احتياطي: لو رقم المتابعة انقطع بنكمّل منه
+  welcomeNudgeAfter: 180, // دقائق بدون رد على الترحيب قبل التذكير (0 = مطفي)
+  welcomeNudgeText: '{تحية} {name} 🌷\nشفت رسالتي؟ إذا عندك دقيقة بحكيلك عن الشغل 👍',
   manualOnly: false, // يدوي بس: الدفعة ما بتبدأ لحالها، بس من زر «ابدأ دفعة اليوم هلأ» بأيام اللقاء
   manualStops: false, // ردك من الجوال بيوقف البوت؟ (لا = بيعتبره جواب وبيكمل)
   joinAck: JOIN_ACK,
@@ -351,6 +354,9 @@ export function mergeFunnel(data) {
   if (!out.disclosure.trim()) out.disclosure = DISCLOSURE_TEXT
   out.manualOnly = !!out.manualOnly
   out.mode = out.mode === 'afterReg' ? 'afterReg' : 'meeting'
+  out.backupAccountId = String(out.backupAccountId || '')
+  out.welcomeNudgeAfter = Math.min(1440, Math.max(0, Math.round(Number(out.welcomeNudgeAfter) || 0)))
+  out.welcomeNudgeText = String(out.welcomeNudgeText ?? '')
   for (const [k, lo, hi] of [['regDelay', 0, 1440], ['regGap', 1, 240], ['dailyCap', 1, 1000]]) {
     const n = Number(out[k])
     out[k] = Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : FUNNEL_DEFAULTS[k]
