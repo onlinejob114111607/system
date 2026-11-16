@@ -44,6 +44,33 @@ export async function buildDailyReport() {
   ])
   const run = (await db.doc(`funnel_runs/${day}`).get().catch(() => null))?.data() || null
   const s = run?.stats || null
+  // المتابعة اليوم (بغض النظر عن يوم اللقاء): ترحيب، ردود، بوك
+  const startMs = start.toMillis()
+  const conv = db.collection('funnel')
+  const [welcomedToday, repliedToday, bookedToday] = await Promise.all([
+    count(conv.where('welcomedAt', '>=', startMs)),
+    count(conv.where('lastInAt', '>=', startMs)),
+    count(conv.where('completedAt', '>=', startMs)),
+  ])
+  // أحسن مصدر آخر 7 أيام (نسبة البوك من الرسائل، بعينة 5 على الأقل)
+  let best = null
+  try {
+    const since = new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10)
+    const runs = await db.collection('funnel_runs').where('day', '>=', since).get()
+    const src = {}
+    for (const r of runs.docs.map((x) => x.data())) {
+      for (const [k, v] of Object.entries(r.stats?.bySource || {})) {
+        const o = (src[k] ||= { welcomed: 0, booked: 0, attended: 0 })
+        o.welcomed += v.welcomed || 0
+        o.booked += v.booked || 0
+        o.attended += v.attended || 0
+      }
+    }
+    best = Object.entries(src)
+      .filter(([, v]) => v.welcomed >= 5)
+      .map(([k, v]) => [k, v, pct(v.booked, v.welcomed)])
+      .sort((a, b) => b[2] - a[2])[0] || null
+  } catch {}
   // المستلمة اليوم + ربحها
   let delivered = 0
   let profit = 0
@@ -83,9 +110,9 @@ export async function buildDailyReport() {
     `📊 تقرير ${wd} ${d}/${m}`,
     '',
     `👥 تسجيلات جديدة: ${n(regs)}`,
-    s
-      ? `🎯 المتابعة: ${s.welcomed} رسالة · ${s.replied || 0} ردّوا · ${s.booked} بوك (${pct(s.booked - (s.invBooked || 0), s.welcomed)}٪) · ${s.attended} حضور`
-      : '🎯 المتابعة: ما في لقاء اليوم',
+    `🎯 المتابعة اليوم: ${n(welcomedToday)} ترحيب · ${n(repliedToday)} تفاعلوا · ${n(bookedToday)} بوك${welcomedToday ? ` (${pct(bookedToday || 0, welcomedToday)}٪)` : ''}`,
+    s ? `🗓 لقاء اليوم: ${s.welcomed} بالدفعة · ${s.booked} بوك · ${s.attended} حضور` : '🗓 ما في لقاء اليوم',
+    best ? `🏆 أحسن مصدر (7 أيام): ${best[0]} — ${best[2]}٪ بوك من ${best[1].welcomed} رسالة` : '🏆 أحسن مصدر: لسا العينة صغيرة',
     `🛒 المتجر: ${n(ordersToday)} طلب جديد · ${delivered} مستلم · ربح ${money(profit)} ₪`,
     `📤 الناشر: ${sent} رسالة · ${joined} انضمام${paused ? ` · ⏸ ${paused} رقم واقف لحمايته` : ''}`,
     `🔎 الصياد: ${n(links)} رابط جديد`,
