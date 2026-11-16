@@ -20,6 +20,14 @@ export const FUNNEL_STEPS = [
     messages: ['مرحباً {name}\nكيف حالك؟\nمعك {اسمي}\nحضرتك تركت تفاصيلك عبر السوشال ميديا بخصوص عمل إضافي تسويق الكتروني..\nصحيح؟'],
   },
   {
+    key: 'focus',
+    label: 'جاهز تركز؟',
+    waitFor: 'any',
+    rejectStops: false,
+    resume: 'جاهز نكمل؟ 🙂',
+    messages: ['جاهز تركز معي دقيقتين حتى أزودك بتفاصيل أكثر عن العمل ؟؟'],
+  },
+  {
     key: 'book',
     label: 'مسج بوك 1 + بوك 2',
     waitFor: 'accept',
@@ -267,6 +275,14 @@ export const FUNNEL_DEFAULTS = {
   disclosure: DISCLOSURE_TEXT,
   nudgeAfter: 120, // دقائق بدون رد قبل رسالة "في حال لم يتم الرد" (0 = مطفية)
   nudgeText: NUDGE_TEXT,
+  // طريقة الترحيب: meeting = دفعة يوم اللقاء · afterReg = كل واحد بعد ما يسجّل بوقت
+  mode: 'meeting',
+  regDelay: 60, // دقائق بعد التسجيل قبل الترحيب (afterReg)
+  regGap: 10, // دقائق بين ترحيب وترحيب (afterReg)
+  quietStart: '23:00', // ساعات الهدوء (توقيت مصر): ما بينبعت ترحيب جديد ولا خطوات
+  quietEnd: '09:00',
+  dailyCap: 60, // أقصى عدد ترحيب جديد باليوم (afterReg)
+  stepsMig: ['focus'], // خطوات جديدة انضافت للنصوص المحفوظة (ما بتنضاف مرتين)
   manualOnly: false, // يدوي بس: الدفعة ما بتبدأ لحالها، بس من زر «ابدأ دفعة اليوم هلأ» بأيام اللقاء
   manualStops: false, // ردك من الجوال بيوقف البوت؟ (لا = بيعتبره جواب وبيكمل)
   joinAck: JOIN_ACK,
@@ -334,6 +350,13 @@ export function mergeFunnel(data) {
   for (const k of ['regLink', 'refNo', 'senderName', 'teamLeader', 'replayLink', 'nudgeText', 'costText', 'disclosure', 'joinAck', 'noShowText']) out[k] = String(out[k] ?? '')
   if (!out.disclosure.trim()) out.disclosure = DISCLOSURE_TEXT
   out.manualOnly = !!out.manualOnly
+  out.mode = out.mode === 'afterReg' ? 'afterReg' : 'meeting'
+  for (const [k, lo, hi] of [['regDelay', 0, 1440], ['regGap', 1, 240], ['dailyCap', 1, 1000]]) {
+    const n = Number(out[k])
+    out[k] = Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : FUNNEL_DEFAULTS[k]
+  }
+  out.quietStart = hm(out.quietStart, FUNNEL_DEFAULTS.quietStart)
+  out.quietEnd = hm(out.quietEnd, FUNNEL_DEFAULTS.quietEnd)
   out.manualStops = !!out.manualStops
   out.discloseOn = !!out.discloseOn
   out.noShowOn = out.noShowOn !== false
@@ -368,6 +391,14 @@ export function mergeFunnel(data) {
     disclose: !!s.disclose,
     messages: msgs(s.messages),
   }))
+  // خطوة «جاهز تركز؟» بتنضاف مرة وحدة للنصوص المحفوظة من قبل (بعد المسج التعريفي)
+  const mig = new Set(Array.isArray(d.stepsMig) ? d.stepsMig : [])
+  if (data && Array.isArray(d.steps) && d.steps.length && !mig.has('focus') && !out.steps.some((s) => s.key === 'focus')) {
+    const at = out.steps.findIndex((s) => s.key === 'welcome')
+    out.steps.splice(at >= 0 ? at + 1 : 1, 0, { ...STEP_DEF.focus, rejectStops: false, voice: '', disclose: false })
+  }
+  mig.add('focus')
+  out.stepsMig = [...mig]
   // رسالة الوضوح إلزامية: لو ولا خطوة معلّمة، بتنحط عالخطوة اللي فيها رابط التسجيل
   if (!out.steps.some((s) => s.disclose)) {
     const i = out.steps.findIndex((s) => s.messages.some((m) => m.includes('{رابط}')))
@@ -463,3 +494,21 @@ export const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0)
 
 // لو التكلفة مش مكتوبة: الأسطر اللي فيها {التكلفة} بتنشال من الرسالة
 export const dropEmptyCost = (text, cfg) => (String(cfg.costText || '').trim() ? text : String(text).split('\n').filter((l) => !l.includes('{التكلفة}')).join('\n'))
+
+// رقم الخطوة الحالية للمحادثة: بالمفتاح (stepKey) لو موجود، وإلا بالرقم القديم
+// (المحادثات اللي بلشت قبل إضافة «جاهز تركز؟» رقمها محسوب بدونها)
+export function stepIndexOf(cfg, conv, raw = conv?.step) {
+  const steps = cfg.steps || []
+  if (raw == null || raw < 0) return raw ?? -1
+  if (conv?.stepKey) {
+    const i = steps.findIndex((s) => s.key === conv.stepKey)
+    if (i >= 0) return i
+  }
+  if (!conv?.stepKey && steps.some((s) => s.key === 'focus') && !conv?.stepsV) {
+    const legacy = steps.filter((s) => s.key !== 'focus')
+    const key = legacy[raw]?.key
+    const i = key ? steps.findIndex((s) => s.key === key) : -1
+    if (i >= 0) return i
+  }
+  return raw
+}

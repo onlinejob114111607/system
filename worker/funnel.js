@@ -16,11 +16,12 @@
 import { generateMessageIDV2 } from 'baileys'
 import { spawn } from 'node:child_process'
 import { db, FieldValue, sleep, ms, dayKey, spin, fill, listen, TZ } from './common.js'
-import { mergeFunnel, meetingTimeOf, scheduleOf, daySummary, SOFT_REJECT, dropEmptyCost, srcOf } from './funnelDefaults.js'
+import { mergeFunnel, meetingTimeOf, scheduleOf, daySummary, SOFT_REJECT, dropEmptyCost, srcOf, stepIndexOf } from './funnelDefaults.js'
 
 const convCol = db.collection('funnel')
 const runsCol = db.collection('funnel_runs')
 const regsCol = db.collection('registrations')
+const paceCol = db.collection('funnel_pace') // وضع «بعد التسجيل»: عدد الترحيب ووقت آخر واحد بكل يوم
 const voicesCol = db.collection('funnel_voices')
 const cfgRef = db.doc('settings/funnel')
 
@@ -302,8 +303,21 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   const isMeetingDay = (day) => !!scheduleOf(cfg, day)
   const eveDay = (day) => !!scheduleOf(cfg, day)?.eve
   // مسموح نبعت هلأ لهالمحادثة؟ (يوم اللقاء من بداية المتابعة للتسكير، أو ليلة قبل للأيام المفعّل فيها)
+  // ساعات الهدوء (توقيت مصر) — مثلاً من 23:00 لـ 09:00
+  const isQuiet = (hm = cairoHM()) => (cfg.quietStart > cfg.quietEnd ? hm >= cfg.quietStart || hm < cfg.quietEnd : hm >= cfg.quietStart && hm < cfg.quietEnd)
+  const afterReg = () => cfg.mode === 'afterReg'
+  // «الخطوة الجاية» + تثبيت مفتاح الخطوة الحالية (عشان المحادثات القديمة ما تنحسب مرتين)
+  const nextStep = (conv) => {
+    const i = stepIndexOf(cfg, conv)
+    return { due: i + 1, stepKey: cfg.steps[i]?.key || null, stepsV: 2 }
+  }
   function canSend(conv) {
     const hm = cairoHM()
+    // وضع «بعد التسجيل»: المحادثة شغالة من الترحيب لحد اللقاء، بس مش بساعات الهدوء
+    if (afterReg()) {
+      if (isQuiet(hm) || conv.day < today()) return false
+      return conv.day !== today() || hm < cfg.closeTime
+    }
     if (conv.day === today()) return hm >= cfg.startTime && hm < cfg.closeTime
     if (conv.day === tomorrow()) return eveDay(conv.day) && hm >= cfg.eveStart && hm < cfg.eveEnd
     return false
@@ -459,7 +473,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   async function needYou(conv, why, extra = {}, label = '') {
     const phone = conv.phone
     await updateConv(phone, { ...extra, attention: true, attentionWhy: why })
-    const st = cfg.steps[conv.step] || {}
+    const st = cfg.steps[stepIndexOf(cfg, conv)] || {}
     const where = conv.status === 'completed' ? 'بعد البوك' : conv.status === 'invite' ? 'دعوة للقاء الجاي' : `بخطوة: ${st.label || ''}`
     const id = await notifier.notify(
       'funnel',
@@ -510,6 +524,8 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     if (dayOver(conv)) return expire(conv)
     const steps = cfg.steps
     let idx = conv.due
+    // محادثة قديمة (قبل «جاهز تركز؟») و«الخطوة الجاية» محسوبة بالرقم القديم
+    if (!conv.stepKey && !conv.stepsV && idx > 0) idx = stepIndexOf(cfg, conv, idx - 1) + 1
     if (idx >= steps.length) return complete(conv, conv.history || [])
 
     let jid
@@ -555,6 +571,8 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     const patch = {
       jid,
       step: idx,
+      stepKey: steps[idx].key,
+      stepsV: 2,
       due: null,
       waitFor: steps[idx].waitFor,
       attention: false,
@@ -772,7 +790,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     const label = text || labelOf(items[0])
     const history = [...(conv.history || []), ...items.map((x) => ({ d: 'in', t: labelOf(x).slice(0, 1500), at: Date.now() }))]
     const base = { history: history.slice(-HISTORY_MAX), lastIn: label.slice(0, 300), lastInAt: Date.now() }
-    const st = cfg.steps[conv.step] || {}
+    const st = cfg.steps[stepIndexOf(cfg, conv)] || {}
     const attention = (why) => needYou(conv, why, base, label)
 
     // 1) أي رفض واضح ← بيوقف كل إشي فوراً (بأي مرحلة)
@@ -800,7 +818,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
       const go = conv.status === 'active' && intent === 'accept' && st.waitFor === 'accept' && conv.due == null
       if (go) {
         const t = autoText.split('\n').filter((l) => !/[؟?]\s*$/.test(l)).join('\n')
-        await updateConv(phone, { ...base, outbox: [...(conv.outbox || []), t], due: conv.step + 1, attention: false, attentionWhy: null, lastAuto: null })
+        await updateConv(phone, { ...base, outbox: [...(conv.outbox || []), t], ...nextStep(conv), attention: false, attentionWhy: null, lastAuto: null })
         return enqueue(phone, true)
       }
       const out = [autoText]
@@ -833,7 +851,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
 
     const w = st.waitFor || 'any'
     const advance = async () => {
-      await updateConv(phone, { ...base, due: conv.step + 1, attention: false, attentionWhy: null, lastAuto: null })
+      await updateConv(phone, { ...base, ...nextStep(conv), attention: false, attentionWhy: null, lastAuto: null })
       if (canSend(conv)) enqueue(phone, true)
     }
     // رد "جاهز/تمام" على سؤال "بتكون جاهز؟" (بعد رد الموعد) بخطوة مش مستنية قبول ← بنذكّره شو المطلوب
@@ -867,7 +885,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     await typing(acc, jid, 2)
     await send(acc, jid, t)
     history.push({ d: 'out', t: t.slice(0, 1500), at: Date.now(), by: 'panel' })
-    const st = cfg.steps[conv.step] || {}
+    const st = cfg.steps[stepIndexOf(cfg, conv)] || {}
     let resumed = false
     if (resume && conv.status === 'active' && st.resume && conv.due == null) {
       const r = fill(st.resume, vars).trim()
@@ -970,6 +988,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
           day,
           status: 'queued',
           step: -1,
+          stepsV: 2,
           due: 0,
           remDue: null,
           rems: {},
@@ -1064,6 +1083,56 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     }
   }
 
+  // ---------- وضع «بعد التسجيل» ----------
+  // أقرب لقاء لسا في وقت قبله (ساعتين على الأقل)
+  function nextMeetingFor() {
+    for (let i = 0; i < 8; i++) {
+      const d = addDays(today(), i)
+      if (isMeetingDay(d) && meetingAt(d) - Date.now() > 2 * 3600_000) return d
+    }
+    return null
+  }
+  let pace = null
+  let paceBusy = false
+  async function regPickup({ force = false } = {}) {
+    if (paceBusy) return { note: 'شغال' }
+    if (isQuiet() && !force) return { note: 'ساعات الهدوء' }
+    if (cfg.discloseOn && !cfg.costText.trim()) {
+      if (Date.now() - costWarned > 3600_000) {
+        costWarned = Date.now()
+        event('error', '⛔ الترحيب واقف: لازم تكتب "التكلفة الكاملة" بإعدادات المتابعة (رسالة الوضوح إلزامية)')
+      }
+      return { note: 'لازم تكتب التكلفة الكاملة بالإعدادات أول' }
+    }
+    paceBusy = true
+    try {
+      const t = today()
+      if (!pace || pace.day !== t) {
+        const s = (await paceCol.doc(t).get()).data() || {}
+        pace = { day: t, count: s.count || 0, lastAt: Math.max(s.lastAt || 0, pace?.lastAt || 0) }
+      }
+      if (pace.count >= cfg.dailyCap) return { note: `وصلنا الحد اليومي (${cfg.dailyCap})` }
+      if (!force && Date.now() - pace.lastAt < cfg.regGap * 60_000) return { note: 'لسا ما خلص الفاصل' }
+      const day = nextMeetingFor()
+      if (!day) return { note: 'ما في لقاء جاي بالجدول' }
+      const cutoff = Date.now() - cfg.regDelay * 60_000
+      const doc = (await pickNew(500)).find((d) => {
+        const at = ms(d.data().createdAt)
+        return at && at <= cutoff
+      })
+      if (!doc) return { note: 'ما في حدا جاهز' }
+      await addConvs([doc], day)
+      pace.count++
+      pace.lastAt = Date.now()
+      await paceCol.doc(t).set({ day: t, count: pace.count, lastAt: pace.lastAt }, { merge: true })
+      const r = doc.data()
+      log(`👋 ترحيب بعد التسجيل: ${r.name || ''} +${r.phone} ← لقاء ${day} (${pace.count}/${cfg.dailyCap} اليوم)`)
+      return { name: r.name || `+${r.phone}` }
+    } finally {
+      paceBusy = false
+    }
+  }
+
   // اليوم اللي بندخّل عليه المسجلين الجداد هلأ (اليوم أو ليلة قبل)
   function openBatchDay() {
     const hm = cairoHM()
@@ -1077,7 +1146,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   // تسجيل جديد (يوم اللقاء لحد ساعة معينة، أو ليلة قبل) بيدخل الدفعة لو في مكان
   async function onNewRegistration(doc) {
     try {
-      if (!cfg.enabled || cfg.manualOnly || (cfg.discloseOn && !cfg.costText.trim())) return
+      if (!cfg.enabled || cfg.manualOnly || afterReg() || (cfg.discloseOn && !cfg.costText.trim())) return
       const open = openBatchDay()
       if (!open || !open.late) return
       const day = open.day
@@ -1220,11 +1289,16 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
         if (busyPhone === c.phone) continue
         if (c.day < t || (c.day === t && hm >= cfg.closeTime && c.status !== 'completed')) await expire(c)
       }
-      if (listenKey !== `${t}|${tomorrow()}`) subscribeDays()
+      if (listenKey !== watchDays().join('|')) subscribeDays()
       if (cfg.enabled) {
-        const open = openBatchDay()
-        // وضع «يدوي بس»: الدفعة ما بتبدأ لحالها — بس من زر «ابدأ دفعة اليوم هلأ» باللوحة
-        if (open && !runDone.has(open.day) && !cfg.manualOnly) await runBatch({ day: open.day })
+        if (afterReg()) {
+          // وضع «بعد التسجيل»: كل واحد بيوصله ترحيب بعد ساعة من تسجيله، بفاصل بين كل واحد والتاني
+          if (!cfg.manualOnly) await regPickup()
+        } else {
+          const open = openBatchDay()
+          // وضع «يدوي بس»: الدفعة ما بتبدأ لحالها — بس من زر «ابدأ دفعة اليوم هلأ» باللوحة
+          if (open && !runDone.has(open.day) && !cfg.manualOnly) await runBatch({ day: open.day })
+        }
         await scheduleTimed()
         await callLists()
         await goalChecks()
@@ -1237,9 +1311,11 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     }
   }
 
+  // الأيام اللي منتابع محادثاتها: يوم اللقاء = اليوم وبكرة، وبوضع «بعد التسجيل» أسبوع لقدّام
+  const watchDays = () => (afterReg() ? Array.from({ length: 8 }, (_, i) => addDays(today(), i)) : [today(), tomorrow()])
   function subscribeDays() {
     unsubDays?.()
-    const days = [today(), tomorrow()]
+    const days = watchDays()
     listenKey = days.join('|')
     for (const d of [...dayRows.keys()]) if (!days.includes(d)) dayRows.delete(d)
     unsubDays = listen(
@@ -1267,6 +1343,11 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
 
   // ---------- أوامر اللوحة ----------
   async function command(c) {
+    if (c.type === 'funnel_run_now' && afterReg()) {
+      // بوضع «بعد التسجيل»: الزر بيرحّب بأقدم واحد جاهز هلأ (بدون ما يستنى الفاصل)
+      const r = await regPickup({ force: true })
+      return r?.name ? { added: 1, note: `انبعت ترحيب لـ ${r.name}` } : { added: 0, note: r?.note || 'ما في حدا جاهز — اللي سجّلوا من أقل من ساعة بيستنوا دورهم' }
+    }
     if (c.type === 'funnel_run_now') {
       // بوضع «يدوي بس» الدفعة بتنبعت بس بأيام اللقاء
       if (cfg.manualOnly && !isMeetingDay(today())) return { added: 0, note: 'اليوم مش يوم لقاء — بوضع «يدوي بس» الدفعة بتنبعت بس بأيام اللقاء' }
