@@ -423,6 +423,20 @@ class Account {
     return (meta?.participants || []).map((p) => p.id).filter(Boolean).slice(0, 1024)
   }
 
+  // «منشن الكل» بدون أرقامنا: أي عضو هو واحد من حساباتنا (رقم أو lid) ما بينعمله منشن
+  async mentionTargets(jid) {
+    let meta = this.participating.get(jid)
+    if (!meta?.participants?.length) {
+      meta = await this.sock.groupMetadata(jid).catch(() => null)
+      if (meta) this.participating.set(jid, meta)
+    }
+    const own = ownIds()
+    return (meta?.participants || [])
+      .filter((p) => p.id && ![p.id, p.phoneNumber, p.jid, p.lid].some((x) => x && own.has(userOf(x))))
+      .map((p) => p.id)
+      .slice(0, 1024)
+  }
+
   // ---------- تنبيه الردود على منشوراتنا ----------
   // 🎣 صياد من مجموعات الواتساب: أي رابط مجموعة بينبعت بمجموعة إحنا فيها ← طابور الصياد
   async harvestLinks(u) {
@@ -573,7 +587,8 @@ class Account {
         const phone = sock.user?.id?.split(':')[0]?.split('@')[0] || null
         this.myIds = new Set([sock.user?.id, sock.user?.lid].filter(Boolean).map((x) => x.split(':')[0].split('@')[0]))
         this.event('ok', `✅ متصل ${phone ? `+${phone}` : ''}`)
-        await this.set({ state: 'open', qr: null, pairingCode: null, phone, waName: sock.user?.name || null, error: null })
+        const lid = sock.user?.lid?.split(':')[0]?.split('@')[0] || null
+        await this.set({ state: 'open', qr: null, pairingCode: null, phone, lid, waName: sock.user?.name || null, error: null })
         await this.refreshParticipating()
         this.pumpAll()
         setTimeout(() => this.connected && this.regionPass().catch((e) => this.log('⚠️ بلد المجموعات:', e.message)), 120_000)
@@ -1201,7 +1216,7 @@ class Account {
         const img = Array.isArray(post.images) ? post.images.find(Boolean) : null
         const content = img ? { image: { url: img }, caption: text } : { text }
         if (post.mentionAll) {
-          const mentions = await this.membersOf(gd.jid).catch(() => [])
+          const mentions = await this.mentionTargets(gd.jid).catch(() => [])
           if (mentions.length) content.mentions = mentions
         }
         const sentMsg = await this.sock.sendMessage(gd.jid, content)
@@ -1445,6 +1460,20 @@ class Account {
 //  إدارة الحسابات
 // ============================================================
 const accounts = new Map()
+// أرقامنا كلها (الرقم والـ lid لكل حساب، حتى لو مش متصل هلأ)
+const userOf = (x) => String(x || '').split(':')[0].split('@')[0].replace(/\D/g, '')
+const knownOwn = new Map() // كل حسابات الواتساب (حتى الموقّفة) ← [رقم، lid]
+function ownIds() {
+  const set = new Set()
+  for (const ids of knownOwn.values()) for (const x of ids) if (x) set.add(userOf(x))
+  for (const a of accounts.values()) {
+    for (const x of a.myIds || []) set.add(userOf(x))
+    if (a.data?.phone) set.add(userOf(a.data.phone))
+    if (a.data?.lid) set.add(userOf(a.data.lid))
+  }
+  set.delete('')
+  return set
+}
 const funnel = createFunnel({ accounts, settings, log, event, notifier })
 const shop = createStore({ accounts, settings, log, event, notifier })
 const social = createSocial({ settings, log, event })
@@ -1758,6 +1787,8 @@ async function main() {
     for (const ch of snap.docChanges()) {
       const id = ch.doc.id
       const data = ch.doc.data()
+      if (ch.type === 'removed') knownOwn.delete(id)
+      else knownOwn.set(id, [data.phone, data.lid])
       if (ch.type === 'removed') {
         stopAccount(id, null)
         continue
