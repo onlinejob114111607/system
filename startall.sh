@@ -2,8 +2,8 @@
 # تشغيل العاملين بالخلفية، كل واحد بنافذة tmux لحاله
 DIR="$(cd "$(dirname "$0")" && pwd)"
 termux-wake-lock 2>/dev/null
-if [ ! -f "$DIR/worker/serviceAccount.json" ]; then
-  echo "❌ حط ملف serviceAccount.json بمجلد worker أول"
+if [ ! -f "$DIR/worker/serviceAccount.json" ] && [ ! -f "$DIR/worker/supabase.json" ]; then
+  echo "❌ حط ملف serviceAccount.json (Firebase) أو supabase.json (Supabase) بمجلد worker أول"
   exit 1
 fi
 tmux kill-session -t wa 2>/dev/null
