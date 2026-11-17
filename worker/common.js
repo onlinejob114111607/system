@@ -3,28 +3,55 @@
 // ============================================================
 import { VERSION } from './version.js'
 import { initializeApp, cert } from 'firebase-admin/app'
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore'
+import { getFirestore, FieldValue as FbFieldValue, Timestamp as FbTimestamp } from 'firebase-admin/firestore'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export { FieldValue, Timestamp }
 
 export const ROOT = path.dirname(fileURLToPath(import.meta.url))
 export const DATA_DIR = path.join(ROOT, 'data')
 export const TZ = 'Africa/Cairo'
 fs.mkdirSync(DATA_DIR, { recursive: true })
 
-// ---------------- Firebase ----------------
+// ---------------- قاعدة البيانات: Supabase أو Firebase ----------------
+// لو ملف supabase.json موجود وفيه "active": true ← Supabase، وإلا Firebase (serviceAccount.json)
+const SUPA_PATH = path.join(ROOT, 'supabase.json')
 const SA_PATH = path.join(ROOT, 'serviceAccount.json')
-if (!fs.existsSync(SA_PATH)) {
-  process.stdout.write('❌ ملف serviceAccount.json مش موجود بمجلد worker\n')
-  process.exit(1)
+const supaCfg = (() => {
+  try {
+    return fs.existsSync(SUPA_PATH) ? JSON.parse(fs.readFileSync(SUPA_PATH, 'utf8')) : null
+  } catch {
+    process.stdout.write('❌ ملف supabase.json فيه خطأ بالكتابة\n')
+    process.exit(1)
+  }
+})()
+export const BACKEND = supaCfg?.active === true ? 'supabase' : 'firebase'
+let db, FieldValue, Timestamp
+if (BACKEND === 'supabase') {
+  const cfg = supaCfg
+  if (!cfg.url || !cfg.serviceKey) {
+    process.stdout.write('❌ ملف supabase.json لازم يكون فيه url و serviceKey\n')
+    process.exit(1)
+  }
+  const m = await import('./supadb.js')
+  const transport = globalThis.WebSocket ? undefined : (await import('ws')).default
+  db = m.createAdminDb({ url: cfg.url, serviceKey: cfg.serviceKey, transport })
+  FieldValue = m.FieldValue
+  Timestamp = m.Timestamp
+} else {
+  if (!fs.existsSync(SA_PATH)) {
+    process.stdout.write('❌ ملف serviceAccount.json مش موجود بمجلد worker\n')
+    process.exit(1)
+  }
+  initializeApp({ credential: cert(JSON.parse(fs.readFileSync(SA_PATH, 'utf8'))) })
+  db = getFirestore()
+  db.settings({ ignoreUndefinedProperties: true })
+  FieldValue = FbFieldValue
+  Timestamp = FbTimestamp
 }
-initializeApp({ credential: cert(JSON.parse(fs.readFileSync(SA_PATH, 'utf8'))) })
-export const db = getFirestore()
-db.settings({ ignoreUndefinedProperties: true })
+export { db, FieldValue, Timestamp }
 
 // ---------------- أدوات عامة ----------------
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
