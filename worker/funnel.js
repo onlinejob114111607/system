@@ -1000,11 +1000,21 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   }
 
   async function addConvs(docs, day) {
+    let added = 0
     for (let i = 0; i < docs.length; i += 200) {
       const b = db.batch()
-      for (const d of docs.slice(i, i + 200)) {
+      const part = docs.slice(i, i + 200)
+      // نفس الرقم سجّل مرة تانية وهو لسا بمحادثة شغالة ← ما منعيد الترحيب، بس منعلّم التسجيل
+      const cur = await Promise.all(part.map((d) => convCol.doc(String(d.data().phone)).get().catch(() => null)))
+      for (const [k, d] of part.entries()) {
         const r = d.data()
         const phone = String(r.phone)
+        const live = cur[k]?.exists && LIVE.includes(cur[k].data().status)
+        if (live) {
+          b.update(d.ref, { status: 'contacted', funnel: { status: 'duplicate', day: cur[k].data().day || day } })
+          continue
+        }
+        added++
         b.set(convCol.doc(phone), {
           phone,
           regId: d.id,
@@ -1030,6 +1040,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
       }
       await b.commit()
     }
+    return added
   }
 
   // اللي حجزوا وما حضروا (آخر أسبوع) ← دعوة وحدة للقاء هاليوم
@@ -1148,7 +1159,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
         return at && at <= cutoff
       })
       if (!doc) return { note: 'ما في حدا جاهز' }
-      await addConvs([doc], day)
+      if (!(await addConvs([doc], day))) return { note: `+${doc.data().phone} سجّل مرة تانية وهو لسا بمحادثة` }
       pace.count++
       pace.lastAt = Date.now()
       await paceCol.doc(t).set({ day: t, count: pace.count, lastAt: pace.lastAt }, { merge: true })
