@@ -3,7 +3,7 @@
 //  نشر على المجموعات، انضمام تلقائي لروابط الصياد، رسائل ترحيب يدوية،
 //  ومتابعة المسجلين التلقائية يوم اللقاء (funnel.js)
 // ============================================================
-import makeWASocket, { Browsers, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from 'baileys'
+import makeWASocket, { Browsers, DisconnectReason, fetchLatestBaileysVersion, getUrlInfo, useMultiFileAuthState } from 'baileys'
 import pino from 'pino'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -1220,15 +1220,9 @@ class Account {
       try {
         const text = await this.buildText(post, g.ref, gd)
         const vi = this._vi ?? 0
-        // النص بيضل بخانة الكتابة («بيكتب...») كم ثانية قبل الإرسال
-        const typing = Math.max(0, Math.min(30, Number(settings.app.wa.typingSeconds ?? 5)))
-        try {
-          await this.sock.sendPresenceUpdate('composing', gd.jid)
-          await sleep((typing + Math.random()) * 1000)
-          await this.sock.sendPresenceUpdate('paused', gd.jid)
-        } catch {}
+        // النص بيضل بخانة الكتابة («بيكتب...») لحد ما تطلع معاينة الرابط (اللوجو) + كم ثانية، وبعدين بينبعت
         const img = Array.isArray(post.images) ? post.images.find(Boolean) : null
-        const content = img ? { image: { url: img }, caption: text } : { text }
+        const content = await this.composeGroupMessage(gd.jid, text, img)
         if (post.mentionAll) {
           const mentions = await this.mentionTargets(gd.jid).catch(() => [])
           if (mentions.length) content.mentions = mentions
@@ -1281,6 +1275,45 @@ class Account {
 
     await this.scheduleRepeat(ref, post)
     return true
+  }
+
+  // معاينة الرابط (اللوجو والعنوان) — زي لما تكتب الرابط بواتساب وتستنى المعاينة تطلع قبل ما تبعت
+  async linkPreview(text) {
+    const url = (String(text || '').match(/https?:\/\/[^\s)\]>"'،]+/i) || [])[0]
+    if (!url) return null
+    const key = url.split(/[?#]/)[0]
+    this.previews ||= new Map()
+    const c = this.previews.get(key)
+    let info = c && Date.now() - c.at < 6 * 3_600_000 ? c.info : null
+    for (let a = 0; !info && a < 3; a++) {
+      // صورة كبيرة (زي واتساب الأصلي)، وإذا ما زبط صورة صغيرة
+      info = await getUrlInfo(url, { thumbnailWidth: 192, fetchOpts: { timeout: 10_000 }, uploadImage: this.sock?.waUploadToServer }).catch(() => null)
+      if (!info || (!info.highQualityThumbnail && !info.jpegThumbnail)) info = (await getUrlInfo(url, { thumbnailWidth: 192, fetchOpts: { timeout: 10_000 } }).catch(() => null)) || info
+      if (!info) await sleep(3000)
+    }
+    if (!info) {
+      this.log('⚠️ ما طلعت معاينة الرابط:', key)
+      return null
+    }
+    this.previews.set(key, { info, at: Date.now() })
+    return { ...info, 'matched-text': url, 'canonical-url': url }
+  }
+
+  // «بيكتب...» بالمجموعة لحد ما تجهز معاينة الرابط + ثواني الكتابة، وبعدين المحتوى الجاهز للإرسال
+  async composeGroupMessage(jid, text, img) {
+    const typing = Math.max(0, Math.min(30, Number(settings.app.wa.typingSeconds ?? 5)))
+    const t0 = Date.now()
+    try {
+      await this.sock.sendPresenceUpdate('composing', jid)
+    } catch {}
+    const lp = img ? null : await this.linkPreview(text)
+    const wait = typing * 1000 + Math.random() * 1000 - (Date.now() - t0)
+    if (wait > 0) await sleep(wait)
+    try {
+      await this.sock.sendPresenceUpdate('paused', jid)
+    } catch {}
+    if (img) return { image: { url: img }, caption: text }
+    return lp ? { text, linkPreview: lp } : { text, linkPreview: null }
   }
 
   // ---------- النشر الآلي ----------
@@ -1337,14 +1370,7 @@ class Account {
       st.tpl = (st.tpl + 1) % 1e6
       try {
         const text = await this.buildText({ text: tpl.text }, g.ref, gd)
-        const typing = Math.max(0, Math.min(30, Number(settings.app.wa.typingSeconds ?? 5)))
-        try {
-          await this.sock.sendPresenceUpdate('composing', gd.jid)
-          await sleep((typing + Math.random()) * 1000)
-          await this.sock.sendPresenceUpdate('paused', gd.jid)
-        } catch {}
-        const img = Array.isArray(tpl.images) ? tpl.images.find(Boolean) : tpl.image || null
-        const content = img ? { image: { url: img }, caption: text } : { text }
+        const content = await this.composeGroupMessage(gd.jid, text, null)
         if (c.mentionAll) {
           const mentions = await this.mentionTargets(gd.jid).catch(() => [])
           if (mentions.length) content.mentions = mentions
