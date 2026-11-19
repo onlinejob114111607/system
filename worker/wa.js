@@ -54,8 +54,15 @@ const linksCol = db.collection('tg_links')
 const regsCol = db.collection('registrations')
 // النشر الآلي: إعداداته بـ settings/waAuto، وحالة كل حساب باليوم بـ wa_auto/{accountId}
 const autoStateCol = db.collection('wa_auto')
-const AUTO_DEFAULTS = { enabled: false, accounts: [], templateIds: [], mentionAll: false, start: '08:00', end: '20:00' }
-let autoCfg = { ...AUTO_DEFAULTS }
+const AUTO_ACC = { enabled: false, templateIds: [], mentionAll: false, start: '08:00', end: '20:00' }
+let autoCfg = {} // { per: { [accountId]: { enabled, templateIds, mentionAll, start, end } } }
+// إعدادات حساب واحد (وبتقرأ الشكل القديم: إعداد واحد لكل الحسابات)
+function autoFor(id) {
+  const p = autoCfg.per?.[id]
+  if (p) return { ...AUTO_ACC, ...p, templateIds: Array.isArray(p.templateIds) ? p.templateIds : [] }
+  if (autoCfg.enabled && Array.isArray(autoCfg.accounts) && autoCfg.accounts.includes(id)) return { ...AUTO_ACC, ...autoCfg, enabled: true, templateIds: autoCfg.templateIds || [] }
+  return null
+}
 let autoTpls = []
 const hmMin = (hm) => {
   const [h, m] = String(hm || '').split(':').map(Number)
@@ -1321,9 +1328,10 @@ class Account {
   // والفاصل = الوقت الباقي ÷ المجموعات الباقية (بيزيد أو بيقل حسب عددها)، والقوالب بتتبدّل
   async autoTick() {
     if (this.autoBusy || this.stopped || !this.connected) return
-    const c = autoCfg
-    if (!c.enabled || !c.accounts.includes(this.id)) return
-    const tpls = autoTpls.filter((t) => c.templateIds.includes(t.id) && String(t.text || '').trim())
+    const c = autoFor(this.id)
+    if (!c?.enabled) return
+    // بالترتيب اللي اخترته فيه القوالب
+    const tpls = c.templateIds.map((id) => autoTpls.find((t) => t.id === id)).filter((t) => t && String(t.text || '').trim())
     if (!tpls.length) return
     const { min, sec } = nowClock()
     const startM = hmMin(c.start)
@@ -2011,10 +2019,7 @@ async function main() {
   // النشر الآلي: الإعدادات + القوالب
   listen(
     db.doc('settings/waAuto'),
-    (d) => {
-      const x = d.data() || {}
-      autoCfg = { ...AUTO_DEFAULTS, ...x, accounts: Array.isArray(x.accounts) ? x.accounts : [], templateIds: Array.isArray(x.templateIds) ? x.templateIds : [] }
-    },
+    (d) => (autoCfg = d.data() || {}),
     (e) => log('⚠️ إعدادات النشر الآلي:', e.message),
   )
   listen(
