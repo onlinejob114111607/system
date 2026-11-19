@@ -595,6 +595,8 @@ class Account {
     this.sock = sock
 
     sock.ev.on('creds.update', saveCreds)
+    // قوائم واتساب (FlowUp...) — بنحفظ اسم ورقم كل قائمة عشان نضيف المحادثات عليها
+    sock.ev.on('labels.edit', (l) => this.onLabel(l))
     sock.ev.on('connection.update', async (u) => {
       if (this.sock !== sock) return
       const { connection, lastDisconnect, qr } = u
@@ -613,6 +615,7 @@ class Account {
         await this.refreshParticipating()
         this.pumpAll()
         setTimeout(() => this.connected && this.regionPass().catch((e) => this.log('⚠️ بلد المجموعات:', e.message)), 120_000)
+        setTimeout(() => this.connected && this.learnLabels().catch((e) => this.log('⚠️ قوائم واتساب:', e.message)), 45_000)
         if (!this.muteScanned && settings.app.wa.muteGroups) this.pumpMutes()
         if (!this.cleanScanned && settings.app.wa.autoClean) setTimeout(() => this.connected && this.cleanScan(), 90_000)
       }
@@ -1284,6 +1287,50 @@ class Account {
     return true
   }
 
+  // ---------- قوائم واتساب (Lists / Labels) ----------
+  onLabel(l) {
+    if (!l?.id) return
+    this.labels ||= { ...(this.data.labels || {}) }
+    if (l.deleted) delete this.labels[l.id]
+    else if (l.name) this.labels[l.id] = String(l.name)
+    clearTimeout(this.labelsSave)
+    this.labelsSave = setTimeout(() => this.set({ labels: this.labels }).catch(() => {}), 3000)
+  }
+
+  // أول مرة (أو إذا ما عنا ولا قائمة محفوظة) بنسحب القوائم من واتساب من جديد
+  async learnLabels(force = false) {
+    const have = Object.keys(this.labels || this.data.labels || {}).length
+    if ((have && !force) || this.labelsTried) return
+    this.labelsTried = true
+    await this.sock.authState.keys.set({ 'app-state-sync-version': { regular: null } })
+    await this.sock.resyncAppState(['regular'], false)
+    await sleep(4000)
+    const n = Object.keys(this.labels || {}).length
+    this.log(n ? `🏷️ قوائم واتساب: ${Object.values(this.labels).join('، ')}` : '🏷️ ما لقيت قوائم على هالحساب')
+  }
+
+  // بعد الترحيب: المحادثة بتنضاف لقائمة (مثلاً FlowUp)
+  async addToWelcomeList(jid) {
+    const name = String(settings.app.wa.welcomeList ?? 'FlowUp').trim()
+    if (!name || !jid || !this.sock) return
+    const find = () => Object.entries(this.labels || this.data.labels || {}).find(([, n]) => String(n).trim().toLowerCase() === name.toLowerCase())?.[0]
+    let id = find()
+    if (!id) {
+      await this.learnLabels(true).catch(() => {})
+      id = find()
+    }
+    if (!id) {
+      if (!this.labelWarned) this.event('warn', `🏷️ ما لقيت قائمة «${name}» على هالحساب — اعملها بواتساب بنفس الاسم`)
+      this.labelWarned = true
+      return
+    }
+    try {
+      await this.sock.addChatLabel(jid, id)
+    } catch (e) {
+      this.log(`⚠️ ما انضاف لقائمة ${name}:`, errText(e))
+    }
+  }
+
   // معاينة الرابط (اللوجو والعنوان) — زي لما تكتب الرابط بواتساب وتستنى المعاينة تطلع قبل ما تبعت
   async linkPreview(text) {
     const url = (String(text || '').match(/https?:\/\/[^\s)\]>"'،]+/i) || [])[0]
@@ -1613,6 +1660,7 @@ class Account {
         }
       }
       this.log(`👋 ترحيب انبعت لـ ${m.name || ''} +${phone}`)
+      await this.addToWelcomeList(r.jid)
     } catch (e) {
       await fail(errText(e))
     }

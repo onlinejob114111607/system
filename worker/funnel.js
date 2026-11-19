@@ -619,6 +619,7 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     if (wasQueued) {
       await updateReg(conv, { status: 'contacted', funnel: { status: 'active', day: conv.day }, welcome: { status: 'sent', at: FieldValue.serverTimestamp(), by: acc.label, error: null } })
       acc.log(`👋 متابعة: مسج تعريفي لـ ${conv.name || ''} +${phone}`)
+      acc.addToWelcomeList?.(jid).catch(() => {})
     } else acc.log(`➡️ متابعة: ${conv.name || phone} ← ${steps[idx].label}`)
   }
 
