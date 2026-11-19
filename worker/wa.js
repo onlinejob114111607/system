@@ -52,6 +52,20 @@ const postsCol = db.collection('wa_posts')
 const dmsCol = db.collection('wa_dms')
 const linksCol = db.collection('tg_links')
 const regsCol = db.collection('registrations')
+// النشر الآلي: إعداداته بـ settings/waAuto، وحالة كل حساب باليوم بـ wa_auto/{accountId}
+const autoStateCol = db.collection('wa_auto')
+const AUTO_DEFAULTS = { enabled: false, accounts: [], templateIds: [], mentionAll: false, start: '08:00', end: '20:00' }
+let autoCfg = { ...AUTO_DEFAULTS }
+let autoTpls = []
+const hmMin = (hm) => {
+  const [h, m] = String(hm || '').split(':').map(Number)
+  return (h || 0) * 60 + (m || 0)
+}
+// الدقيقة الحالية من اليوم (بتوقيت النظام) + الثواني
+function nowClock() {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(new Date()).map((x) => [x.type, x.value]))
+  return { min: Number(p.hour) * 60 + Number(p.minute), sec: Number(p.second) }
+}
 
 const HUNTER_CATEGORY = 'صياد الروابط'
 const MUTE_FOREVER_MS = 20 * 365 * 86_400_000
@@ -1269,6 +1283,121 @@ class Account {
     return true
   }
 
+  // ---------- النشر الآلي ----------
+  // كل حساب مفعّل بيمرق على كل مجموعاته مرة باليوم بين ساعة البداية والنهاية،
+  // والفاصل = الوقت الباقي ÷ المجموعات الباقية (بيزيد أو بيقل حسب عددها)، والقوالب بتتبدّل
+  async autoTick() {
+    if (this.autoBusy || this.stopped || !this.connected) return
+    const c = autoCfg
+    if (!c.enabled || !c.accounts.includes(this.id)) return
+    const tpls = autoTpls.filter((t) => c.templateIds.includes(t.id) && String(t.text || '').trim())
+    if (!tpls.length) return
+    const { min, sec } = nowClock()
+    const startM = hmMin(c.start)
+    const endM = hmMin(c.end)
+    if (endM <= startM || min < startM || min >= endM) return
+    const left = ((endM - min) * 60 - sec) * 1000 // الوقت الباقي لآخر النشر
+    this.autoBusy = true
+    try {
+      const day = dayKey()
+      if (!this.auto || this.auto.day !== day) {
+        const saved = (await autoStateCol.doc(this.id).get()).data() || {}
+        this.auto = saved.day === day ? { done: [], sent: 0, failed: 0, skipped: 0, tpl: 0, next: 0, ...saved } : { day, done: [], sent: 0, failed: 0, skipped: 0, tpl: saved.tpl || 0, next: 0 }
+      }
+      const st = this.auto
+      if (Date.now() < (st.next || 0)) return
+      if (this.quiet() || this.postLimitReached()) {
+        const why = this.quiet() ? 'ساعات الهدوء' : this.paused() ? 'النشر واقف مؤقتاً لحماية الرقم' : 'وصل حد الإرسال'
+        if (st.note !== why) {
+          st.note = why
+          await this.saveAuto()
+        }
+        return
+      }
+      const doneSet = new Set(st.done)
+      const groups = (await this.resolveTargets({ target: 'all' })).filter((g) => !doneSet.has(g.id))
+      st.total = st.done.length + groups.length
+      if (!groups.length) {
+        st.next = Date.now() + left
+        st.note = 'خلصت كل المجموعات لليوم ✓'
+        await this.saveAuto()
+        return
+      }
+      const g = groups[0]
+      const gd = g.data()
+      st.done.push(g.id)
+      const gapH = Number(settings.app.wa.groupGapHours) || 0
+      if (gapH > 0 && ms(gd.lastPostAt) > Date.now() - gapH * 3_600_000) {
+        st.skipped++
+        st.next = 0 // تخطّي ← المجموعة الجاية فوراً
+        await this.saveAuto()
+        return
+      }
+      const tpl = tpls[st.tpl % tpls.length]
+      st.tpl = (st.tpl + 1) % 1e6
+      try {
+        const text = await this.buildText({ text: tpl.text }, g.ref, gd)
+        const typing = Math.max(0, Math.min(30, Number(settings.app.wa.typingSeconds ?? 5)))
+        try {
+          await this.sock.sendPresenceUpdate('composing', gd.jid)
+          await sleep((typing + Math.random()) * 1000)
+          await this.sock.sendPresenceUpdate('paused', gd.jid)
+        } catch {}
+        const img = Array.isArray(tpl.images) ? tpl.images.find(Boolean) : tpl.image || null
+        const content = img ? { image: { url: img }, caption: text } : { text }
+        if (c.mentionAll) {
+          const mentions = await this.mentionTargets(gd.jid).catch(() => [])
+          if (mentions.length) content.mentions = mentions
+        }
+        const sentMsg = await this.sock.sendMessage(gd.jid, content)
+        if (sentMsg?.key?.id) this.lastMsg.set(gd.jid, { key: { ...sentMsg.key }, messageTimestamp: sentMsg.messageTimestamp || Math.floor(Date.now() / 1000) })
+        this.lastPosted.set(gd.jid, Date.now())
+        this.countSent()
+        this.noteRisk('sent')
+        st.sent++
+        st.lastGroup = gd.name || ''
+        st.lastTpl = tpl.title || ''
+        st.lastAt = Date.now()
+        st.error = null
+        await g.ref.update({ lastPostAt: FieldValue.serverTimestamp(), postCount: FieldValue.increment(1), ...(gd.failCount ? { failCount: 0, health: null } : {}) }).catch(() => {})
+        this.log(`🤖 آلي ← ${gd.name} (${tpl.title || 'قالب'})`)
+      } catch (e) {
+        const msg = errText(e)
+        st.failed++
+        st.error = `${gd.name}: ${msg}`
+        this.log(`❌ آلي ← ${gd.name} —`, msg)
+        const fails = (gd.failCount || 0) + 1
+        if (isForbidden(msg)) await g.ref.update({ enabled: false, health: 'blocked', error: msg, failCount: fails }).catch(() => {})
+        else if (!/rate/i.test(msg)) await g.ref.update({ failCount: fails, error: msg, ...(fails >= 3 ? { enabled: false, health: 'failing' } : {}) }).catch(() => {})
+        if (/rate/i.test(msg)) {
+          this.noteRisk('rate')
+          await this.autoPause('واتساب طلب تهدئة (rate limit) بالنشر الآلي')
+        } else if (!isForbidden(msg)) this.noteRisk('fail')
+      }
+      // الفاصل للمجموعة الجاية: الوقت الباقي ÷ المجموعات الباقية، ±15% عشوائي، وأقل إشي دقيقة
+      const rest = groups.length - 1
+      const base = rest > 0 ? left / rest : left
+      st.gapMin = Math.round(base / 60000)
+      st.next = Date.now() + Math.max(60_000, base * (0.85 + Math.random() * 0.3))
+      st.note = null
+      await this.saveRisk().catch(() => {})
+      await this.saveAuto()
+    } catch (e) {
+      this.log('⚠️ النشر الآلي:', e.message)
+    } finally {
+      this.autoBusy = false
+    }
+  }
+
+  async saveAuto() {
+    const st = this.auto
+    if (!st) return
+    await autoStateCol
+      .doc(this.id)
+      .set({ ...st, done: st.done.slice(-3000), account: this.label, updatedAt: FieldValue.serverTimestamp() })
+      .catch((e) => this.log('⚠️ حفظ حالة النشر الآلي:', e.message))
+  }
+
   async computeAB(post) {
     const res = await postsCol.doc(post.parentId).collection('results').where('status', '==', 'sent').get()
     const clicks = new Map()
@@ -1852,6 +1981,22 @@ async function main() {
     },
     (e) => log('⚠️ مستمع الترحيب:', e.message),
   )
+
+  // النشر الآلي: الإعدادات + القوالب
+  listen(
+    db.doc('settings/waAuto'),
+    (d) => {
+      const x = d.data() || {}
+      autoCfg = { ...AUTO_DEFAULTS, ...x, accounts: Array.isArray(x.accounts) ? x.accounts : [], templateIds: Array.isArray(x.templateIds) ? x.templateIds : [] }
+    },
+    (e) => log('⚠️ إعدادات النشر الآلي:', e.message),
+  )
+  listen(
+    db.collection('templates'),
+    (s) => (autoTpls = s.docs.map((d) => ({ id: d.id, ...d.data() }))),
+    (e) => log('⚠️ القوالب:', e.message),
+  )
+  setInterval(() => accounts.forEach((a) => a.autoTick()), 30_000)
 
   listenCommands('wa', handleCommand, log)
   startDailyReport({ settings, notifier, log })
