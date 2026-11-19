@@ -404,3 +404,21 @@ export async function deleteQuery(q) {
 // فلتر جودة روابط الصياد: أسماء سبام/إباحية/قمار/نصب (أو مليانة إيموجي)
 const SPAM_RE = /(casino|\bbet(s|ting)?\b|1xbet|melbet|\bporn|xxx|\bsex(y)?\b|onlyfans|\bnudes?\b|escort|crypto\s*pump|forex\s*signals?|binary\s*options?|free\s*followers|قمار|مراهنات|كازينو|سكس|اباحي|إباحي|سحب\s*(على\s*)?(فلوس|جوائز|ايفون|آيفون)|اربح\s*\d+\s*\$|توصيات\s*(فوركس|كريبتو)|متابعين\s*مجان)/i
 export const isSpamName = (...texts) => texts.some((t) => SPAM_RE.test(String(t || ''))) || (String(texts[0] || '').match(/\p{Extended_Pictographic}/gu) || []).length >= 8
+
+// ---------------- أرقام فلسطين: 970 ↔ 972 ----------------
+// نفس رقم الجوال الفلسطيني (059/056...) ممكن يكون فاتح واتساب بمقدمة 970 أو 972،
+// والشخص ممكن يسجّل بالتانية — فبنجرّب الاتنين
+export function phoneVariants(phone) {
+  const p = String(phone || '').replace(/\D/g, '')
+  const m = /^(970|972)(5\d{8})$/.exec(p)
+  return m ? [p, (m[1] === '970' ? '972' : '970') + m[2]] : [p]
+}
+
+// بيرجع { jid, phone } للنسخة الموجودة على واتساب، أو null
+export async function findOnWhatsApp(sock, phone) {
+  for (const p of phoneVariants(phone)) {
+    const [r] = (await sock.onWhatsApp(p).catch(() => null)) || []
+    if (r?.exists) return { jid: r.jid, phone: p }
+  }
+  return null
+}
