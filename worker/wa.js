@@ -11,6 +11,7 @@ import {
   db,
   FieldValue,
   findOnWhatsApp,
+  phoneVariants,
   Timestamp,
   ROOT,
   sleep,
@@ -1645,6 +1646,7 @@ class Account {
       const r = await findOnWhatsApp(this.sock, phone)
       if (!r) return fail('الرقم مش موجود على واتساب (جرّبنا 970 و972)')
       if (r.phone !== phone) this.log(`🔁 +${phone} موجود على واتساب كـ +${r.phone}`)
+      if (regRef) regRef.update({ waPhone: r.phone, waChecked: true }).catch(() => {})
       const first = String(m.name || '').trim().split(/\s+/)[0] || ''
       const text = spin(fill(m.text || settings.site.waGreeting || 'أهلاً {name} 👋', { name: first }))
       try {
@@ -1954,6 +1956,32 @@ async function hunterTick() {
 }
 
 // ---------------- تنبيه التسجيلات الجديدة ----------------
+// أرقام فلسطين (970/972): بنعرف أي مقدمة عليها الواتساب فعلاً، عشان زر الواتساب باللوحة يفتح الرقم الصح
+let waCheckChain = Promise.resolve()
+function checkWaPhone(ref, phone) {
+  if (phoneVariants(phone).length < 2) return
+  waCheckChain = waCheckChain
+    .then(async () => {
+      const acc = [...accounts.values()].find((a) => a.connected && a.sock)
+      if (!acc) return
+      const r = await findOnWhatsApp(acc.sock, phone)
+      await ref.update({ waPhone: r ? r.phone : null, waChecked: true }).catch(() => {})
+      await sleep(1500)
+    })
+    .catch(() => {})
+}
+
+// مرة وحدة: تسجيلات آخر 14 يوم بأرقام 970/972 اللي لسا ما انفحصت
+async function backfillWaPhones() {
+  if (![...accounts.values()].some((a) => a.connected)) return setTimeout(() => backfillWaPhones().catch(() => {}), 5 * 60_000)
+  const since = Timestamp.fromMillis(Date.now() - 14 * 86_400_000)
+  const snap = await regsCol.where('createdAt', '>=', since).get()
+  const todo = snap.docs.filter((d) => !d.data().waChecked && phoneVariants(d.data().phone).length > 1)
+  if (!todo.length) return
+  log(`📞 فحص مقدمة الواتساب (970/972) لـ ${todo.length} تسجيل...`)
+  for (const d of todo) checkWaPhone(d.ref, d.data().phone)
+}
+
 function watchRegistrations() {
   const since = Timestamp.now()
   const seen = new Set()
@@ -1964,6 +1992,7 @@ function watchRegistrations() {
           if (ch.type !== 'added' || seen.has(ch.doc.id)) continue
           seen.add(ch.doc.id)
           funnel.onNewRegistration(ch.doc)
+          checkWaPhone(ch.doc.ref, ch.doc.data().phone)
           const r = ch.doc.data()
           const where = [r.city, r.country].filter(Boolean).join('، ')
           const src = [r.ref && r.ref !== 'direct' ? `المسوّق: ${r.ref}` : '', r.utm ? `المصدر: ${r.utm}` : ''].filter(Boolean).join(' · ')
@@ -2084,6 +2113,7 @@ async function main() {
   startDailyReport({ settings, notifier, log })
   social.start()
   watchRegistrations()
+  setTimeout(() => backfillWaPhones().catch((e) => log('⚠️ فحص 970/972:', e.message)), 4 * 60_000)
   funnel.start()
   shop.start()
   watchOtherWorker('tg', notifier)

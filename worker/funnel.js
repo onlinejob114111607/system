@@ -463,7 +463,11 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     if (conv.jid) return conv.jid
     // إذا مش موجود بالمقدمة اللي سجّل فيها، بنجرّب التانية (970 ↔ 972)
     const r = await findOnWhatsApp(acc.sock, conv.phone)
-    if (r && r.phone !== conv.phone) acc.log(`🔁 +${conv.phone} موجود على واتساب كـ +${r.phone}`)
+    if (r && r.phone !== conv.phone) {
+      acc.log(`🔁 +${conv.phone} موجود على واتساب كـ +${r.phone}`)
+      updateReg(conv, { waPhone: r.phone, waChecked: true })
+      convCol.doc(conv.phone).update({ waPhone: r.phone }).catch(() => {})
+    }
     return r?.jid || null
   }
 
