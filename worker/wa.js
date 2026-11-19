@@ -1741,6 +1741,7 @@ async function handleCommand(c) {
     return { ok: true }
   }
   if (c.type === 'delete_account') return deleteAccount(c.accountId)
+  if (c.type === 'wa_check_phones') return backfillWaPhones({ days: null, recheck: !!c.recheck })
   if (c.type === 'daily_report_now') {
     const text = await buildDailyReport()
     await notifier.notify('test', text)
@@ -1957,29 +1958,54 @@ async function hunterTick() {
 
 // ---------------- تنبيه التسجيلات الجديدة ----------------
 // أرقام فلسطين (970/972): بنعرف أي مقدمة عليها الواتساب فعلاً، عشان زر الواتساب باللوحة يفتح الرقم الصح
+// التقدّم بينحفظ بـ jobs/wa_check (اللوحة بتعرضه)
+const waJobRef = db.doc('jobs/wa_check')
+const waJob = { total: 0, done: 0, wrong: 0, none: 0, running: false }
 let waCheckChain = Promise.resolve()
+const saveWaJob = () => waJobRef.set({ ...waJob, updatedAt: FieldValue.serverTimestamp() }).catch(() => {})
 function checkWaPhone(ref, phone) {
-  if (phoneVariants(phone).length < 2) return
+  if (phoneVariants(phone).length < 2) return false
+  waJob.total++
+  waJob.running = true
   waCheckChain = waCheckChain
     .then(async () => {
-      const acc = [...accounts.values()].find((a) => a.connected && a.sock)
-      if (!acc) return
-      const r = await findOnWhatsApp(acc.sock, phone)
-      await ref.update({ waPhone: r ? r.phone : null, waChecked: true }).catch(() => {})
-      await sleep(1500)
+      let acc = [...accounts.values()].find((a) => a.connected && a.sock)
+      for (let i = 0; !acc && i < 60; i++) {
+        await sleep(10_000) // الواتساب مش متصل ← بنستنى شوي
+        acc = [...accounts.values()].find((a) => a.connected && a.sock)
+      }
+      if (acc) {
+        const r = await findOnWhatsApp(acc.sock, phone)
+        await ref.update({ waPhone: r ? r.phone : null, waChecked: true }).catch(() => {})
+        if (!r) waJob.none++
+        else if (r.phone !== String(phone)) waJob.wrong++
+        await sleep(1500)
+      }
+      waJob.done++
+      if (waJob.done >= waJob.total) {
+        waJob.running = false
+        await saveWaJob()
+        if (waJob.total > 1) log(`📞 خلص فحص 970/972: ${waJob.wrong} بمقدمة غلط، ${waJob.none} مش على واتساب (من ${waJob.total})`)
+      } else if (waJob.done % 10 === 0) await saveWaJob()
     })
     .catch(() => {})
+  return true
 }
 
-// مرة وحدة: تسجيلات آخر 14 يوم بأرقام 970/972 اللي لسا ما انفحصت
-async function backfillWaPhones() {
-  if (![...accounts.values()].some((a) => a.connected)) return setTimeout(() => backfillWaPhones().catch(() => {}), 5 * 60_000)
-  const since = Timestamp.fromMillis(Date.now() - 14 * 86_400_000)
-  const snap = await regsCol.where('createdAt', '>=', since).get()
-  const todo = snap.docs.filter((d) => !d.data().waChecked && phoneVariants(d.data().phone).length > 1)
-  if (!todo.length) return
-  log(`📞 فحص مقدمة الواتساب (970/972) لـ ${todo.length} تسجيل...`)
-  for (const d of todo) checkWaPhone(d.ref, d.data().phone)
+// فحص التسجيلات بأرقام 970/972 اللي لسا ما انفحصت (days = null ← كل التسجيلات، recheck ← حتى اللي انفحصوا)
+async function backfillWaPhones({ days = 14, recheck = false } = {}) {
+  let q = regsCol
+  if (days) q = q.where('createdAt', '>=', Timestamp.fromMillis(Date.now() - days * 86_400_000))
+  const snap = await q.get()
+  const todo = snap.docs.filter((d) => (recheck || !d.data().waChecked) && phoneVariants(d.data().phone).length > 1)
+  if (!waJob.running) Object.assign(waJob, { total: 0, done: 0, wrong: 0, none: 0 })
+  let n = 0
+  for (const d of todo) if (checkWaPhone(d.ref, d.data().phone)) n++
+  if (n) {
+    log(`📞 فحص مقدمة الواتساب (970/972) لـ ${n} تسجيل...`)
+    await saveWaJob()
+  }
+  return { queued: n, scanned: snap.size }
 }
 
 function watchRegistrations() {
@@ -2113,7 +2139,7 @@ async function main() {
   startDailyReport({ settings, notifier, log })
   social.start()
   watchRegistrations()
-  setTimeout(() => backfillWaPhones().catch((e) => log('⚠️ فحص 970/972:', e.message)), 4 * 60_000)
+  setTimeout(() => backfillWaPhones({ days: 14 }).catch((e) => log('⚠️ فحص 970/972:', e.message)), 4 * 60_000)
   funnel.start()
   shop.start()
   watchOtherWorker('tg', notifier)
