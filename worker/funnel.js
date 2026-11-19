@@ -15,7 +15,7 @@
 // ============================================================
 import { generateMessageIDV2 } from 'baileys'
 import { spawn } from 'node:child_process'
-import { db, FieldValue, sleep, ms, dayKey, spin, fill, listen, TZ } from './common.js'
+import { db, FieldValue, sleep, ms, dayKey, spin, fill, listen, TZ, phoneVariants, findOnWhatsApp } from './common.js'
 import { mergeFunnel, meetingTimeOf, scheduleOf, daySummary, SOFT_REJECT, dropEmptyCost, srcOf, stepIndexOf } from './funnelDefaults.js'
 
 const convCol = db.collection('funnel')
@@ -461,8 +461,10 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
 
   async function resolveJid(acc, conv) {
     if (conv.jid) return conv.jid
-    const [r] = (await acc.sock.onWhatsApp(conv.phone)) || []
-    return r?.exists ? r.jid : null
+    // إذا مش موجود بالمقدمة اللي سجّل فيها، بنجرّب التانية (970 ↔ 972)
+    const r = await findOnWhatsApp(acc.sock, conv.phone)
+    if (r && r.phone !== conv.phone) acc.log(`🔁 +${conv.phone} موجود على واتساب كـ +${r.phone}`)
+    return r?.jid || null
   }
 
   // بيبعت مجموعة رسائل ورا بعض (بينها msgGap) — عنصر {voice} = فويس
@@ -712,7 +714,14 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
   }
 
   // ---------- الرسائل الواردة ----------
+  // رقم المرسل ← رقم المحادثة عنا (حتى لو واتسابه بالمقدمة التانية 970/972)
   async function phoneOf(acc, key) {
+    const p = await rawPhoneOf(acc, key)
+    if (!p || convs.has(p)) return p
+    return phoneVariants(p).find((v) => convs.has(v)) || p
+  }
+
+  async function rawPhoneOf(acc, key) {
     const jid = key.remoteJid
     if (jid.endsWith('@s.whatsapp.net')) return digits(jid)
     if (key.remoteJidAlt && key.remoteJidAlt.endsWith('@s.whatsapp.net')) {
@@ -1462,6 +1471,32 @@ export function createFunnel({ accounts, settings, log, event, notifier }) {
     setTimeout(tick, 15_000)
     setInterval(tick, 30_000)
     pollTelegram().catch(() => {})
+    setTimeout(() => retryOtherPrefix().catch((e) => log('⚠️ فحص 970/972:', e.message)), 3 * 60_000)
+  }
+
+  // اللي فشلوا "مش على واتساب" وأرقامهم فلسطينية ← بنجرّب المقدمة التانية (970 ↔ 972) مرة وحدة،
+  // وإذا طلعوا موجودين بيرجعوا لطابور الترحيب
+  async function retryOtherPrefix() {
+    const acc = accounts.get(accountId())
+    if (!acc?.connected) return setTimeout(() => retryOtherPrefix().catch(() => {}), 5 * 60_000)
+    const snap = await convCol.where('status', '==', 'failed').get()
+    let n = 0
+    for (const d of snap.docs) {
+      const c = d.data()
+      if (c.prefixRetry || !/مش موجود على واتساب/.test(c.error || '') || phoneVariants(d.id).length < 2) continue
+      await d.ref.update({ prefixRetry: true }).catch(() => {})
+      const r = await findOnWhatsApp(acc.sock, d.id)
+      await sleep(1500)
+      if (!r) continue
+      await regsCol
+        .doc(c.regId || d.id)
+        .update({ status: 'new', funnel: FieldValue.delete(), welcome: FieldValue.delete() })
+        .catch(() => {})
+      await d.ref.delete().catch(() => {})
+      n++
+      log(`🔁 +${d.id} طلع على واتساب كـ +${r.phone} ← رجع لطابور الترحيب`)
+    }
+    if (n) event('ok', `🔁 ${n} رقم كانوا «مش على واتساب» طلعوا موجودين بالمقدمة التانية (970/972) ورجعوا لطابور الترحيب`)
   }
 
   return {

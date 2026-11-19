@@ -10,6 +10,7 @@ import path from 'node:path'
 import {
   db,
   FieldValue,
+  findOnWhatsApp,
   Timestamp,
   ROOT,
   sleep,
@@ -1640,8 +1641,10 @@ class Account {
       this.log(`❌ ترحيب +${phone}: ${error}`)
     }
     try {
-      const [r] = (await this.sock.onWhatsApp(phone)) || []
-      if (!r?.exists) return fail('الرقم مش موجود على واتساب')
+      // إذا مش موجود بالمقدمة اللي سجّل فيها بنجرّب التانية (970 ↔ 972)
+      const r = await findOnWhatsApp(this.sock, phone)
+      if (!r) return fail('الرقم مش موجود على واتساب (جرّبنا 970 و972)')
+      if (r.phone !== phone) this.log(`🔁 +${phone} موجود على واتساب كـ +${r.phone}`)
       const first = String(m.name || '').trim().split(/\s+/)[0] || ''
       const text = spin(fill(m.text || settings.site.waGreeting || 'أهلاً {name} 👋', { name: first }))
       try {

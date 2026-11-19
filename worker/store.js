@@ -3,7 +3,7 @@
 //  اللوحة بتحط الطلب "confirm_queued" مع نص الرسالة ← العامل بيبعتها
 //  ← الزبون بيرد "تم" ← الطلب بيصير "مؤكد" لحاله
 // ============================================================
-import { db, FieldValue, Timestamp, sleep, listen } from './common.js'
+import { db, FieldValue, Timestamp, sleep, listen, findOnWhatsApp } from './common.js'
 import { classify, readMessage } from './funnel.js'
 import { mergeFunnel } from './funnelDefaults.js'
 import { translateTexts } from './translate.js'
@@ -92,10 +92,10 @@ export function createStore({ accounts, settings, log, event, notifier }) {
       let jid = null
       let used = null
       for (const p of [o.phone1, o.phone2].filter(Boolean)) {
-        const [r] = (await acc.sock.onWhatsApp(p)) || []
-        if (r?.exists) {
+        const r = await findOnWhatsApp(acc.sock, p)
+        if (r) {
           jid = r.jid
-          used = p
+          used = r.phone
           break
         }
       }
