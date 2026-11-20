@@ -295,9 +295,51 @@ export function createSocial({ settings, log, event }) {
   const HOOK = ['hook', null, 'Make.com']
   const viaMake = () => cfg.metaVia === 'make'
   const isJpg = (u) => !/\.(png|webp|gif)(\?|#|$)/i.test(String(u || ''))
+  // فحص كل صورة قبل ما تروح لـ Make: بتفتح؟ وشو نوعها فعلاً؟ وحجمها مقبول؟
+  // (فيسبوك بيرفض المنشور كله إذا صورة وحدة خربانة أو WebP — "Missing or invalid image file")
+  const imgCache = new Map() // url -> { type, size } | null
+  async function probeImage(u) {
+    if (imgCache.has(u)) return imgCache.get(u)
+    let info = null
+    for (const method of ['HEAD', 'GET']) {
+      try {
+        const r = await fetch(u, { method, redirect: 'follow', signal: AbortSignal.timeout(15_000) })
+        if (method === 'GET') r.body?.cancel?.().catch(() => {})
+        if (!r.ok) continue
+        info = { type: String(r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(), size: Number(r.headers.get('content-length')) || 0 }
+        break
+      } catch {}
+    }
+    imgCache.set(u, info)
+    return info
+  }
+  const MB = 1024 * 1024
+  async function checkPhotos(list) {
+    const fb = []
+    const ig = []
+    const bad = []
+    for (const u of list) {
+      const i = await probeImage(u)
+      if (!i) {
+        bad.push(`${u.split('/').pop()} (ما بتفتح)`)
+        continue
+      }
+      const okFb = ['image/jpeg', 'image/jpg', 'image/png'].includes(i.type) && (!i.size || i.size <= 8 * MB)
+      if (!okFb) {
+        bad.push(`${u.split('/').pop()} (${i.type || 'نوع مش معروف'}${i.size > 8 * MB ? `، ${Math.round(i.size / MB)}MB` : ''})`)
+        continue
+      }
+      fb.push(u)
+      if (i.type !== 'image/png' && (!i.size || i.size <= 8 * MB)) ig.push(u)
+    }
+    return { fb, ig, bad }
+  }
+
   async function sendHook(url, it, day, index, test = false) {
-    const photos = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean).slice(0, 10)
-    const igPhotos = photos.filter(isJpg).slice(0, 10)
+    const all = (it.photos?.length ? it.photos : [it.photo]).filter(Boolean).slice(0, 10)
+    const { fb: photos, ig: igPhotos, bad } = await checkPhotos(all)
+    if (bad.length) log(`🖼️ ${it.name}: شلت ${bad.length} صورة مش مقبولة عند فيسبوك/إنستا — ${bad.join('، ')}`)
+    if (!photos.length) throw new Error('ولا صورة من صور المنتج صالحة للنشر (كلها ما بتفتح أو بصيغة مش مقبولة)')
     const body = {
       test,
       day,
