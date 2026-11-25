@@ -1626,7 +1626,12 @@ class Account {
         this.tried.add(`dm_${d.id}`)
         await this.waitConnected()
         // الملغي أو الموقوف ما بيستنى فاصل
-        if ((await this.sendDm(d)) !== false) await sleep(rand(20, 45) * 1000)
+        if ((await this.sendDm(d)) !== false) {
+          // الفاصل بين ترحيب والتاني (من الإعدادات، بالثواني)
+          const lo = Math.max(5, Number(settings.app.wa.dmGapMin) || 20)
+          const hi = Math.max(lo, Number(settings.app.wa.dmGapMax) || 45)
+          await sleep(rand(lo, hi) * 1000)
+        }
       }
     } catch (e) {
       if (e.message !== 'stopped') this.log('⚠️ طابور الترحيب:', e.message)
