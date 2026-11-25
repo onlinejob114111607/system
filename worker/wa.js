@@ -300,9 +300,12 @@ class Account {
   }
 
   apply(data) {
+    const wasPaused = !!this.data?.dmPaused
     this.data = data
     this.label = data.name || this.id
     this.settings = cleanSettings(data.settings)
+    // طابور الترحيب رجع اشتغل من اللوحة ← نكمّل فوراً
+    if (wasPaused && !data.dmPaused && this.connected) this.pumpDms()
   }
 
   log(...a) {
@@ -1613,17 +1616,17 @@ class Account {
 
   // ---------- رسائل الترحيب (يدوية من اللوحة) ----------
   async pumpDms() {
-    if (this.dming || !this.connected) return
+    if (this.dming || !this.connected || this.data?.dmPaused) return
     this.dming = true
     try {
-      while (!this.stopped) {
+      while (!this.stopped && !this.data?.dmPaused) {
         const list = (queuedDms.get(this.id) || []).filter((d) => !this.tried.has(`dm_${d.id}`))
         if (!list.length) break
         const d = list[0]
         this.tried.add(`dm_${d.id}`)
         await this.waitConnected()
-        await this.sendDm(d)
-        await sleep(rand(20, 45) * 1000)
+        // الملغي أو الموقوف ما بيستنى فاصل
+        if ((await this.sendDm(d)) !== false) await sleep(rand(20, 45) * 1000)
       }
     } catch (e) {
       if (e.message !== 'stopped') this.log('⚠️ طابور الترحيب:', e.message)
@@ -1633,7 +1636,11 @@ class Account {
   }
 
   async sendDm(doc) {
-    const m = doc.data()
+    // قبل كل رسالة: يمكن انلغت أو الطابور وقف من اللوحة
+    const cur = (await doc.ref.get().catch(() => null))?.data()
+    if (!cur || cur.status !== 'queued' || this.data?.dmPaused) return false
+    await doc.ref.update({ status: 'sending', startedAt: FieldValue.serverTimestamp(), by: this.label }).catch(() => {})
+    const m = cur
     const phone = String(m.phone || '').replace(/\D/g, '')
     const regRef = m.regId ? regsCol.doc(m.regId) : null
     const fail = async (error) => {
@@ -2135,6 +2142,10 @@ async function main() {
   )
   setInterval(() => accounts.forEach((a) => a.autoTick()), 30_000)
 
+  // ترحيبات علقت بـ "عم ينبعت" (العامل وقف بنصها) ← ترجع للطابور
+  try {
+    for (const d of (await dmsCol.where('status', '==', 'sending').get()).docs) await d.ref.update({ status: 'queued' }).catch(() => {})
+  } catch {}
   listenCommands('wa', handleCommand, log)
   startDailyReport({ settings, notifier, log })
   social.start()
